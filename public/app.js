@@ -59,8 +59,13 @@
   function api(method, pathName, body) {
     var init = { method: method, headers: { 'Accept': 'application/json' } };
     if (body !== undefined) {
-      init.headers['Content-Type'] = 'application/json';
-      init.body = JSON.stringify(body);
+      if (typeof FormData !== 'undefined' && body instanceof FormData) {
+        // Let the browser set Content-Type (incl. the multipart boundary).
+        init.body = body;
+      } else {
+        init.headers['Content-Type'] = 'application/json';
+        init.body = JSON.stringify(body);
+      }
     }
     return fetch(pathName, init).then(function (res) {
       return res.text().then(function (txt) {
@@ -125,23 +130,51 @@
     submitBtn.addEventListener('click', function () {
       errBox.hidden = true;
       var responses = {};
+      var fileFields = {}; // fieldId -> array of File objects
       var missing = [];
       fields.forEach(function (f) {
         var getter = inputs[f.id];
         var val = getter ? getter() : '';
+        var isFile = (f.fieldType === 'file' || f.fieldType === 'file-upload');
         if (f.required && (val == null || (Array.isArray(val) ? val.length === 0 : String(val).trim() === ''))) {
           missing.push(f.label || f.id);
         }
-        responses[f.id] = val;
+        if (isFile) {
+          fileFields[f.id] = Array.isArray(val) ? val : [];
+        } else {
+          responses[f.id] = val;
+        }
       });
       if (missing.length) {
         errBox.textContent = 'Please fill in: ' + missing.join(', ');
         errBox.hidden = false;
         return;
       }
+
+      // Backward-compat: only switch to multipart when files were actually chosen.
+      var hasFiles = Object.keys(fileFields).some(function (id) { return fileFields[id].length > 0; });
+      var payload;
+      if (hasFiles) {
+        var fd = new FormData();
+        fd.append('responses', JSON.stringify(responses));
+        var fileFieldMap = {}; // fieldId -> [ multipart part names ]
+        Object.keys(fileFields).forEach(function (id) {
+          var partName = 'file__' + id;
+          fileFieldMap[id] = [];
+          fileFields[id].forEach(function (file) {
+            fd.append(partName, file, file.name);
+            fileFieldMap[id].push(partName);
+          });
+        });
+        fd.append('fileFieldMap', JSON.stringify(fileFieldMap));
+        payload = fd;
+      } else {
+        payload = { responses: responses };
+      }
+
       submitBtn.disabled = true;
       submitBtn.textContent = 'Submitting…';
-      api('POST', '/api/request-forms/public/' + encodeURIComponent(token) + '/submit', { responses: responses })
+      api('POST', '/api/request-forms/public/' + encodeURIComponent(token) + '/submit', payload)
         .then(function (res) {
           if (res.ok) {
             render(thankYouState('Your responses have been submitted. Thank you!'));
@@ -241,8 +274,14 @@
       inputs[f.id] = function () {
         return Array.prototype.slice.call(control.querySelectorAll('input:checked')).map(function (c) { return c.value; });
       };
+    } else if (ft === 'file' || ft === 'file-upload') {
+      control = el('input', { class: 'cp-input cp-file', type: 'file', multiple: true });
+      control.dataset.cpFile = '1';
+      inputs[f.id] = function () {
+        return Array.prototype.slice.call(control.files || []);
+      };
     } else {
-      // text / file (file rendered as a text URL note) / fallback
+      // text / fallback
       control = el('input', { class: 'cp-input', type: 'text', placeholder: f.placeholder });
       inputs[f.id] = function () { return control.value; };
     }
