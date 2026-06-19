@@ -4,8 +4,12 @@
  * Agri360 Client Portal — SPA
  * ----------------------------
  * Client-facing, no login. Two flows only:
- *   1) /form/:token        — fill + submit a focus-points questionnaire.
- *   2) /approvals/:token   — approve / request changes on CC deliverables.
+ *   1) /form/:token            — fill + submit a focus-points questionnaire.
+ *   2) /approvals/:portalToken — approve / request changes on CC deliverables.
+ *
+ * The :portalToken is an opaque, unguessable string (clients.portal_token).
+ * It is passed straight through to the CRM, which resolves it to a client —
+ * the portal never parses it as a numeric id or sends a ?clientId param.
  *
  * All data calls go through this app's own same-origin /api/* proxy, which
  * injects the shared X-Portal-Key header server-side. The browser never sees
@@ -247,16 +251,19 @@
   }
 
   // ════════════════════════════════════════════════════════════════
-  // FLOW 2 — CC APPROVALS   /approvals/:clientToken
+  // FLOW 2 — CC APPROVALS   /approvals/:portalToken
   // ════════════════════════════════════════════════════════════════
-  function loadApprovals(clientToken) {
+  // portalToken is an opaque, unguessable string (clients.portal_token).
+  // It is forwarded verbatim to the CRM, which resolves it to a client —
+  // no parseInt, no ?clientId.
+  function loadApprovals(portalToken) {
     render(el('div', { class: 'cp-loading', text: 'Loading approvals…' }));
-    api('GET', '/api/request-forms/public/portal/' + encodeURIComponent(clientToken) + '/approvals').then(function (r) {
+    api('GET', '/api/request-forms/public/portal/' + encodeURIComponent(portalToken) + '/approvals').then(function (r) {
       if (!r.ok) {
         return render(errorState('Could not load your approvals. The link may be invalid.'));
       }
       var items = extractDeliverables(r.data);
-      renderApprovalList(clientToken, items);
+      renderApprovalList(portalToken, items);
     }).catch(function () {
       render(errorState('Could not load your approvals. Please try again.'));
     });
@@ -285,7 +292,31 @@
     return s === 'approved';
   }
 
-  function renderApprovalList(clientToken, items) {
+  // ── asset URL resolver (website-design previews) ─────────────────
+  // Uploaded design assets come back as CRM-relative paths
+  // (`/uploads/client-assets/…`). The portal proxies BOTH /api/* and
+  // /uploads/* to the CRM, so these stay SAME-ORIGIN to the portal — which
+  // is required for the <iframe> PDF preview (the CRM serves files with CSP
+  // `frame-ancestors 'self'`, blocking cross-origin framing). So relative
+  // paths are returned untouched; absolute URLs / data URIs / external
+  // designLinks pass through as-is.
+  function assetUrl(u) {
+    if (!u) return '';
+    var s = String(u);
+    if (/^(https?:)?\/\//i.test(s) || s.indexOf('data:') === 0 || s.indexOf('blob:') === 0) return s;
+    if (s.charAt(0) !== '/') s = '/' + s;
+    return s; // same-origin via the portal's /uploads proxy
+  }
+  function isWebsiteDesign(d) { return d && d.type === 'website-design'; }
+  function looksLikeImage(u) { return /\.(png|jpe?g|gif|webp|avif|svg|bmp)(\?|#|$)/i.test(String(u || '')); }
+  function looksLikePdf(u) { return /\.pdf(\?|#|$)/i.test(String(u || '')); }
+  function metaOf(d) {
+    var meta = d.metadata || d.meta || {};
+    if (typeof meta === 'string') { try { meta = JSON.parse(meta); } catch (e) { meta = {}; } }
+    return meta && typeof meta === 'object' ? meta : {};
+  }
+
+  function renderApprovalList(portalToken, items) {
     var wrap = el('div', {}, [
       el('h1', { class: 'cp-h1', text: 'Content Approvals' }),
       el('p', { class: 'cp-sub', text: 'Review the content below and approve, or request changes.' }),
@@ -300,6 +331,13 @@
     }
 
     items.forEach(function (d) {
+      // Website-design deliverables get a dedicated approval card; the CC
+      // per-post path below is left fully intact.
+      if (isWebsiteDesign(d)) {
+        wrap.appendChild(renderWebsiteDesignCard(portalToken, d));
+        return;
+      }
+
       var cards = mediaPosts(d);
       var allApproved = cards.length > 0 && cards.every(function (c) { return isApprovedStatus(c.post.status); });
 
@@ -319,7 +357,7 @@
       if (!cards.length) {
         card.appendChild(el('p', { class: 'cp-note', text: 'No media to review for this item yet.' }));
       } else {
-        card.appendChild(renderGallery(clientToken, d, cards));
+        card.appendChild(renderGallery(portalToken, d, cards));
       }
 
       wrap.appendChild(card);
@@ -328,7 +366,7 @@
     render(wrap);
   }
 
-  function renderGallery(clientToken, deliverable, cards) {
+  function renderGallery(portalToken, deliverable, cards) {
     var gallery = el('div', { class: 'cp-gallery' });
 
     cards.forEach(function (c) {
@@ -343,7 +381,7 @@
         loading: 'lazy',
       });
       thumb.addEventListener('click', function () {
-        openDetail(clientToken, deliverable, c);
+        openDetail(portalToken, deliverable, c);
       });
       postCard.appendChild(thumb);
 
@@ -360,10 +398,10 @@
       } else {
         var approveBtn = el('button', { class: 'cp-btn cp-btn-approve', type: 'button', text: 'Approve' });
         approveBtn.addEventListener('click', function () {
-          approvePost(clientToken, deliverable, c, approveBtn);
+          approvePost(portalToken, deliverable, c, approveBtn);
         });
         var editBtn = el('button', { class: 'cp-btn', type: 'button', text: 'Review' });
-        editBtn.addEventListener('click', function () { openDetail(clientToken, deliverable, c); });
+        editBtn.addEventListener('click', function () { openDetail(portalToken, deliverable, c); });
         actions.appendChild(approveBtn);
         actions.appendChild(editBtn);
       }
@@ -375,7 +413,7 @@
     return gallery;
   }
 
-  function approvePost(clientToken, deliverable, card, btn) {
+  function approvePost(portalToken, deliverable, card, btn) {
     if (btn) { btn.disabled = true; btn.textContent = 'Approving…'; }
     api('POST', '/api/request-forms/public/portal/approve', {
       deliverableId: deliverable.id,
@@ -385,7 +423,7 @@
       if (res.ok) {
         // Re-fetch so the CRM's auto-advance / approved state is reflected.
         var routeToken = currentRoute().token;
-        loadApprovals(routeToken || clientToken);
+        loadApprovals(routeToken || portalToken);
       } else if (btn) {
         btn.disabled = false;
         btn.textContent = 'Approve';
@@ -397,8 +435,299 @@
     });
   }
 
+  // ════════════════════════════════════════════════════════════════
+  // WEBSITE-DESIGN APPROVAL CARD  (type === 'website-design')
+  // ════════════════════════════════════════════════════════════════
+  // Two rounds reach the client:
+  //   • status 'sent_for_approval' → design mock-ups  ("Design approval")
+  //   • status 'final_review'      → built site       ("Final site approval")
+  // Previews the uploaded design assets + any metadata.designLinks, then
+  // offers whole-deliverable Approve / Request-changes (no postIndex/size).
+  function renderWebsiteDesignCard(portalToken, d) {
+    var meta = metaOf(d);
+    var status = d.status || '';
+    var approved = status === 'approved' || status === 'resizing' || !!d.approvedAt || !!d.approval_date;
+    var roundLabel = status === 'final_review' ? 'Final site approval' : 'Design approval';
+
+    var head = el('div', { class: 'cp-card-head' }, [
+      el('div', {}, [
+        el('h2', { class: 'cp-card-title', text: d.title || d.name || 'Website Design' }),
+        el('div', { class: 'cp-wd-round', text: roundLabel }),
+      ]),
+      approved
+        ? el('span', { class: 'cp-badge cp-badge-approved', text: 'Approved' })
+        : el('span', { class: 'cp-badge cp-badge-action', text: 'Approval required' }),
+    ]);
+
+    var card = el('div', { class: 'cp-card ' + (approved ? 'cp-card-approved' : 'cp-card-action') }, [head]);
+
+    if (d.approvedAt || d.approval_date) {
+      card.appendChild(el('p', { class: 'cp-note', text: 'Approved on ' + formatDate(d.approvedAt || d.approval_date) }));
+    }
+
+    // ── Previews ──────────────────────────────────────────────────
+    var assets = Array.isArray(d.assets) ? d.assets : [];
+    var links = Array.isArray(meta.designLinks) ? meta.designLinks : [];
+
+    var imageAssets = assets.filter(function (a) {
+      return a && a.url && ((a.mimeType && a.mimeType.indexOf('image/') === 0) || looksLikeImage(a.url));
+    });
+    var pdfAssets = assets.filter(function (a) {
+      return a && a.url && ((a.mimeType === 'application/pdf') || looksLikePdf(a.url));
+    });
+    var otherAssets = assets.filter(function (a) {
+      return a && a.url && imageAssets.indexOf(a) === -1 && pdfAssets.indexOf(a) === -1;
+    });
+
+    var hasAnything = imageAssets.length || pdfAssets.length || otherAssets.length || links.length;
+    if (!hasAnything) {
+      card.appendChild(el('p', { class: 'cp-note', text: 'No designs to preview yet.' }));
+    }
+
+    // Image thumbnails → lightbox (collect all preview-able image URLs so the
+    // lightbox can page through them).
+    var lightboxUrls = imageAssets.map(function (a) { return assetUrl(a.url); });
+    links.forEach(function (lk) { if (lk && lk.url && looksLikeImage(lk.url)) lightboxUrls.push(assetUrl(lk.url)); });
+
+    if (imageAssets.length) {
+      var grid = el('div', { class: 'cp-wd-grid' });
+      imageAssets.forEach(function (a) {
+        var full = assetUrl(a.url);
+        var thumb = el('img', {
+          class: 'cp-wd-thumb',
+          src: full,
+          alt: a.title || 'Design preview',
+          loading: 'lazy',
+          title: a.title || '',
+        });
+        thumb.addEventListener('click', function () {
+          openImageLightbox(lightboxUrls, lightboxUrls.indexOf(full));
+        });
+        grid.appendChild(thumb);
+      });
+      card.appendChild(grid);
+    }
+
+    // PDFs → inline iframe + open button.
+    pdfAssets.forEach(function (a) {
+      var url = assetUrl(a.url);
+      var block = el('div', { class: 'cp-wd-pdf' });
+      block.appendChild(el('div', { class: 'cp-wd-filelabel', text: a.title || 'PDF design' }));
+      block.appendChild(el('iframe', { class: 'cp-wd-pdf-frame', src: url, title: a.title || 'PDF design' }));
+      var openRow = el('div', { class: 'cp-wd-fileactions' }, [
+        el('a', { class: 'cp-btn', href: url, target: '_blank', rel: 'noopener', text: 'Open PDF' }),
+      ]);
+      block.appendChild(openRow);
+      card.appendChild(block);
+    });
+
+    // Other files → open button.
+    if (otherAssets.length) {
+      var fileRow = el('div', { class: 'cp-wd-fileactions' });
+      otherAssets.forEach(function (a) {
+        fileRow.appendChild(el('a', {
+          class: 'cp-btn', href: assetUrl(a.url), target: '_blank', rel: 'noopener',
+          text: a.title ? ('Open ' + a.title) : 'Open file',
+        }));
+      });
+      card.appendChild(fileRow);
+    }
+
+    // Design links → open buttons (+ inline preview for image/pdf links).
+    if (links.length) {
+      var linkRow = el('div', { class: 'cp-wd-fileactions' });
+      links.forEach(function (lk) {
+        if (!lk || !lk.url) return;
+        var url = assetUrl(lk.url);
+        linkRow.appendChild(el('a', {
+          class: 'cp-btn', href: url, target: '_blank', rel: 'noopener',
+          text: lk.label || 'Open design',
+        }));
+      });
+      card.appendChild(linkRow);
+
+      links.forEach(function (lk) {
+        if (!lk || !lk.url) return;
+        var url = assetUrl(lk.url);
+        if (looksLikePdf(lk.url)) {
+          card.appendChild(el('iframe', { class: 'cp-wd-pdf-frame', src: url, title: lk.label || 'PDF design' }));
+        }
+        // image links already added to lightboxUrls; render a thumbnail too.
+        if (looksLikeImage(lk.url)) {
+          var grid2 = el('div', { class: 'cp-wd-grid' });
+          var t = el('img', { class: 'cp-wd-thumb', src: url, alt: lk.label || 'Design preview', loading: 'lazy' });
+          t.addEventListener('click', function () { openImageLightbox(lightboxUrls, lightboxUrls.indexOf(url)); });
+          grid2.appendChild(t);
+          card.appendChild(grid2);
+        }
+      });
+    }
+
+    // ── Actions ───────────────────────────────────────────────────
+    if (approved) {
+      card.appendChild(el('div', { class: 'cp-wd-approved-note' }, [
+        el('span', { class: 'cp-post-approved-tag', text: '✓ Approved' }),
+      ]));
+      return card;
+    }
+
+    var roundsUsed = parseInt(meta.changeRequestRoundsUsed, 10) || 0;
+    var roundsLeft = Math.max(0, 3 - roundsUsed);
+
+    var warn = el('div', { class: 'cp-warn', hidden: true });
+    var crBox = el('textarea', { class: 'cp-textarea', placeholder: 'Describe the changes you would like…' });
+    var crWrap = el('div', { class: 'cp-wd-cr', hidden: true }, [
+      el('div', { class: 'cp-editor-label', text: 'Request changes' }),
+      crBox,
+    ]);
+
+    // Optional screenshot upload (mirrors the CC change-request pattern).
+    var fileInput = el('input', { class: 'cp-input', type: 'file', accept: 'image/*' });
+    crWrap.appendChild(el('div', { class: 'cp-editor-label', text: 'Attach a screenshot (optional)' }));
+    crWrap.appendChild(fileInput);
+    crWrap.appendChild(warn);
+
+    var actions = el('div', { class: 'cp-actions' });
+
+    var approveBtn = el('button', { class: 'cp-btn cp-btn-approve', type: 'button', text: 'Approve' });
+    approveBtn.addEventListener('click', function () {
+      approveWebsiteDesign(portalToken, d, approveBtn);
+    });
+
+    var changeBtn = el('button', { class: 'cp-btn cp-btn-primary', type: 'button', text: 'Request changes' });
+    var sendBtn = el('button', { class: 'cp-btn cp-btn-primary', type: 'button', text: 'Send change request', hidden: true });
+
+    if (roundsLeft <= 0) {
+      changeBtn.disabled = true;
+      changeBtn.textContent = 'No change rounds left';
+    }
+
+    changeBtn.addEventListener('click', function () {
+      // Reveal the change-request box on first click.
+      crWrap.hidden = false;
+      changeBtn.hidden = true;
+      sendBtn.hidden = false;
+      crBox.focus();
+    });
+
+    sendBtn.addEventListener('click', function () {
+      submitWebsiteDesignChange(portalToken, d, crBox, fileInput, sendBtn, warn);
+    });
+
+    actions.appendChild(approveBtn);
+    actions.appendChild(changeBtn);
+    actions.appendChild(sendBtn);
+    card.appendChild(actions);
+
+    if (roundsUsed > 0) {
+      card.appendChild(el('p', { class: 'cp-note', text: roundsLeft + ' change round' + (roundsLeft === 1 ? '' : 's') + ' left.' }));
+    }
+
+    card.appendChild(crWrap);
+    return card;
+  }
+
+  function approveWebsiteDesign(portalToken, d, btn) {
+    if (btn) { btn.disabled = true; btn.textContent = 'Approving…'; }
+    api('POST', '/api/request-forms/public/portal/approve', {
+      deliverableId: d.id,
+    }).then(function (res) {
+      if (res.ok) {
+        loadApprovals(currentRoute().token || portalToken);
+      } else if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Approve';
+        alert((res.data && res.data.error) || 'Could not approve. Please try again.');
+      }
+    }).catch(function () {
+      if (btn) { btn.disabled = false; btn.textContent = 'Approve'; }
+      alert('Could not approve. Please try again.');
+    });
+  }
+
+  function submitWebsiteDesignChange(portalToken, d, crBox, fileInput, btn, warn) {
+    warn.hidden = true;
+    var body = (crBox.value || '').trim();
+    if (!body) {
+      warn.textContent = 'Please describe the change before sending.';
+      warn.hidden = false;
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Sending…';
+
+    function send(screenshots) {
+      api('POST', '/api/request-forms/public/portal/change-request', {
+        deliverableId: d.id,
+        body: body,
+        screenshots: screenshots,
+      }).then(function (res) {
+        if (res.ok) {
+          render(thankYouState('Your change request has been sent. We will be in touch.'));
+        } else if (res.status === 409) {
+          btn.disabled = false;
+          btn.textContent = 'Send change request';
+          warn.textContent = 'No change rounds left — please approve.';
+          warn.hidden = false;
+        } else {
+          btn.disabled = false;
+          btn.textContent = 'Send change request';
+          warn.textContent = (res.data && res.data.error) || 'Could not send. Please try again.';
+          warn.hidden = false;
+        }
+      }).catch(function () {
+        btn.disabled = false;
+        btn.textContent = 'Send change request';
+        warn.textContent = 'Could not send. Please try again.';
+        warn.hidden = false;
+      });
+    }
+
+    var file = fileInput.files && fileInput.files[0];
+    if (file) {
+      var reader = new FileReader();
+      reader.onload = function () { send([reader.result]); };
+      reader.onerror = function () { send([]); };
+      reader.readAsDataURL(file);
+    } else {
+      send([]);
+    }
+  }
+
+  // Simple image lightbox (reuses the overlay shell). Pages through `urls`.
+  function openImageLightbox(urls, startIndex) {
+    var list = (urls || []).filter(Boolean);
+    if (!list.length) return;
+    var idx = startIndex >= 0 && startIndex < list.length ? startIndex : 0;
+
+    var img = el('img', { class: 'cp-lightbox-img', src: list[idx], alt: 'Design preview' });
+    var counter = el('div', { class: 'cp-lightbox-counter' });
+    function refresh() {
+      img.src = list[idx];
+      counter.textContent = (idx + 1) + ' / ' + list.length;
+    }
+
+    var closeBtn = el('button', { class: 'cp-modal-close', type: 'button', html: '&times;' });
+    closeBtn.addEventListener('click', closeOverlay);
+
+    var box = el('div', { class: 'cp-lightbox' }, [closeBtn, img]);
+
+    if (list.length > 1) {
+      var prev = el('button', { class: 'cp-lightbox-nav cp-lightbox-prev', type: 'button', html: '&#8249;' });
+      var next = el('button', { class: 'cp-lightbox-nav cp-lightbox-next', type: 'button', html: '&#8250;' });
+      prev.addEventListener('click', function () { idx = (idx - 1 + list.length) % list.length; refresh(); });
+      next.addEventListener('click', function () { idx = (idx + 1) % list.length; refresh(); });
+      box.appendChild(prev);
+      box.appendChild(next);
+      box.appendChild(counter);
+    }
+
+    refresh();
+    openOverlay(box);
+  }
+
   // ── Detail / change-request view (modal) ─────────────────────────
-  function openDetail(clientToken, deliverable, card) {
+  function openDetail(portalToken, deliverable, card) {
     var modal = el('div', { class: 'cp-modal' });
 
     var closeBtn = el('button', { class: 'cp-modal-close', type: 'button', html: '&times;' });
@@ -445,11 +774,11 @@
     var approveBtn = el('button', { class: 'cp-btn cp-btn-approve', type: 'button', text: 'Approve as-is' });
     approveBtn.addEventListener('click', function () {
       closeOverlay();
-      approvePost(clientToken, deliverable, card, null);
+      approvePost(portalToken, deliverable, card, null);
     });
     var sendBtn = el('button', { class: 'cp-btn cp-btn-primary', type: 'button', text: 'Send change request' });
     sendBtn.addEventListener('click', function () {
-      submitChangeRequest(clientToken, deliverable, card, editor, crBox, fileInput, sendBtn, warn);
+      submitChangeRequest(portalToken, deliverable, card, editor, crBox, fileInput, sendBtn, warn);
     });
     actions.appendChild(approveBtn);
     actions.appendChild(sendBtn);
@@ -459,7 +788,7 @@
     openOverlay(modal);
   }
 
-  function submitChangeRequest(clientToken, deliverable, card, editor, crBox, fileInput, btn, warn) {
+  function submitChangeRequest(portalToken, deliverable, card, editor, crBox, fileInput, btn, warn) {
     warn.hidden = true;
     var body = crBox.value.trim();
     var captionEdits = editor.innerHTML;
@@ -482,7 +811,7 @@
       }).then(function (res) {
         if (res.ok) {
           closeOverlay();
-          loadApprovals(currentRoute().token || clientToken);
+          loadApprovals(currentRoute().token || portalToken);
         } else if (res.status === 409) {
           btn.disabled = false;
           btn.textContent = 'Send change request';

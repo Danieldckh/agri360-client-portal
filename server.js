@@ -76,6 +76,29 @@ app.all('/api/*', async (req, res) => {
   }
 });
 
+/*
+ * Proxy CRM-served uploads (design files, images, PDFs) so they are
+ * SAME-ORIGIN to the portal. Required for the website-design <iframe> PDF
+ * preview: the CRM serves files with CSP `frame-ancestors 'self'`, which
+ * blocks a cross-origin portal from framing them. Streams the binary body
+ * and content-type verbatim. These files are public on the CRM; the portal
+ * key is forwarded harmlessly.
+ */
+app.get('/uploads/*', async (req, res) => {
+  const targetUrl = CRM_API_BASE + req.originalUrl;
+  try {
+    const upstream = await fetch(targetUrl, { method: 'GET', headers: { 'X-Portal-Key': PORTAL_KEY } });
+    res.status(upstream.status);
+    const ct = upstream.headers.get('content-type');
+    if (ct) res.set('Content-Type', ct);
+    const buf = Buffer.from(await upstream.arrayBuffer());
+    return res.send(buf);
+  } catch (err) {
+    console.error('CRM uploads proxy error:', req.path, '-', err && err.message);
+    return res.status(502).end();
+  }
+});
+
 // Static SPA assets.
 app.use(express.static(PUBLIC_DIR));
 
