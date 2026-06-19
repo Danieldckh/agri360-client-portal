@@ -1,0 +1,17 @@
+{
+  "name": "agri360-client-portal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Client-facing portal for Agri360: focus-points forms + content-calendar approvals. Tiny Express server that serves a static SPA and proxies /api/* to the Agri360 CRM, injecting the shared portal key server-side.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check public/app.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
