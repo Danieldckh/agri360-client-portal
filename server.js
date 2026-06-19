@@ -84,13 +84,36 @@ app.all('/api/*', async (req, res) => {
  * and content-type verbatim. These files are public on the CRM; the portal
  * key is forwarded harmlessly.
  */
+// Allowlist of content-types safe to serve inline on our own origin (cannot
+// execute script). Anything else (svg/html/xml/…) is forced to a download.
+var UPLOAD_INLINE_TYPES = ['application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 app.get('/uploads/*', async (req, res) => {
-  const targetUrl = CRM_API_BASE + req.originalUrl;
+  // Validate the path: only /uploads/<safe segments>, no traversal / encoded
+  // traversal / backslashes — so it can never be rewritten to another CRM route
+  // (the X-Portal-Key would otherwise ride along to a non-uploads endpoint).
+  var sub = req.params[0] || '';
+  if (sub.indexOf('..') !== -1 || sub.indexOf('\\') !== -1 || /%2e%2e|%2f|%5c/i.test(sub)) {
+    return res.status(400).end();
+  }
+  var safePath = '/uploads/' + sub.split('/').filter(Boolean).map(encodeURIComponent).join('/');
+  var targetUrl;
+  try { targetUrl = new URL(safePath, CRM_API_BASE); } catch (e) { return res.status(400).end(); }
+  if (targetUrl.href.indexOf(new URL('/uploads/', CRM_API_BASE).href) !== 0) {
+    return res.status(400).end();
+  }
   try {
-    const upstream = await fetch(targetUrl, { method: 'GET', headers: { 'X-Portal-Key': PORTAL_KEY } });
+    const upstream = await fetch(targetUrl.href, { method: 'GET', headers: { 'X-Portal-Key': PORTAL_KEY } });
     res.status(upstream.status);
-    const ct = upstream.headers.get('content-type');
-    if (ct) res.set('Content-Type', ct);
+    res.set('X-Content-Type-Options', 'nosniff');
+    var ct = (upstream.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    if (UPLOAD_INLINE_TYPES.indexOf(ct) !== -1) {
+      res.set('Content-Type', ct); // safe to render inline (pdf preview / image thumbs)
+    } else {
+      // Never serve attacker-influenced types (svg/html/xml) inline on our origin.
+      res.set('Content-Type', 'application/octet-stream');
+      res.set('Content-Disposition', 'attachment');
+      res.set('Content-Security-Policy', "default-src 'none'; sandbox");
+    }
     const buf = Buffer.from(await upstream.arrayBuffer());
     return res.send(buf);
   } catch (err) {
