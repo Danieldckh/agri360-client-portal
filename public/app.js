@@ -347,6 +347,7 @@
     return s; // same-origin via the portal's /uploads proxy
   }
   function isWebsiteDesign(d) { return d && d.type === 'website-design'; }
+  function isAgri4allProductUploads(d) { return d && d.type === 'agri4all-product-uploads'; }
   function looksLikeImage(u) { return /\.(png|jpe?g|gif|webp|avif|svg|bmp)(\?|#|$)/i.test(String(u || '')); }
   function looksLikePdf(u) { return /\.pdf(\?|#|$)/i.test(String(u || '')); }
   function metaOf(d) {
@@ -374,6 +375,14 @@
       // per-post path below is left fully intact.
       if (isWebsiteDesign(d)) {
         wrap.appendChild(renderWebsiteDesignCard(portalToken, d));
+        return;
+      }
+
+      // Agri4All product-upload design approvals get their own card
+      // (status 'sent_for_approval' → design approval), mirroring the
+      // website-design whole-deliverable approve / change-request flow.
+      if (isAgri4allProductUploads(d)) {
+        wrap.appendChild(renderAgri4allProductCard(portalToken, d));
         return;
       }
 
@@ -685,6 +694,208 @@
   }
 
   function submitWebsiteDesignChange(portalToken, d, crBox, fileInput, btn, warn) {
+    warn.hidden = true;
+    var body = (crBox.value || '').trim();
+    if (!body) {
+      warn.textContent = 'Please describe the change before sending.';
+      warn.hidden = false;
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Sending…';
+
+    function send(screenshots) {
+      api('POST', '/api/request-forms/public/portal/change-request', {
+        deliverableId: d.id,
+        body: body,
+        screenshots: screenshots,
+      }).then(function (res) {
+        if (res.ok) {
+          render(thankYouState('Your change request has been sent. We will be in touch.'));
+        } else if (res.status === 409) {
+          btn.disabled = false;
+          btn.textContent = 'Send change request';
+          warn.textContent = 'No change rounds left — please approve.';
+          warn.hidden = false;
+        } else {
+          btn.disabled = false;
+          btn.textContent = 'Send change request';
+          warn.textContent = (res.data && res.data.error) || 'Could not send. Please try again.';
+          warn.hidden = false;
+        }
+      }).catch(function () {
+        btn.disabled = false;
+        btn.textContent = 'Send change request';
+        warn.textContent = 'Could not send. Please try again.';
+        warn.hidden = false;
+      });
+    }
+
+    var file = fileInput.files && fileInput.files[0];
+    if (file) {
+      var reader = new FileReader();
+      reader.onload = function () { send([reader.result]); };
+      reader.onerror = function () { send([]); };
+      reader.readAsDataURL(file);
+    } else {
+      send([]);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // AGRI4ALL PRODUCT-UPLOADS DESIGN APPROVAL CARD
+  //   (type === 'agri4all-product-uploads')
+  // ════════════════════════════════════════════════════════════════
+  // The CRM sends these at status 'sent_for_approval' (design approval).
+  // Mirrors the website-design card: previews the attached design image(s)
+  // from the deliverable's assets, then offers whole-deliverable
+  // Approve / Request-changes (no postIndex/size). Design images are read
+  // from `d.assets` (same shape the website-design payload exposes) with a
+  // fallback to any image fields the row itself provides.
+  function renderAgri4allProductCard(portalToken, d) {
+    var meta = metaOf(d);
+    var status = d.status || '';
+    var approved = status === 'approved' || !!d.approvedAt || !!d.approval_date;
+
+    var head = el('div', { class: 'cp-card-head' }, [
+      el('div', {}, [
+        el('h2', { class: 'cp-card-title', text: d.title || d.name || 'Product Design' }),
+        el('div', { class: 'cp-wd-round', text: 'Design approval' }),
+      ]),
+      approved
+        ? el('span', { class: 'cp-badge cp-badge-approved', text: 'Approved' })
+        : el('span', { class: 'cp-badge cp-badge-action', text: 'Approval required' }),
+    ]);
+
+    var card = el('div', { class: 'cp-card ' + (approved ? 'cp-card-approved' : 'cp-card-action') }, [head]);
+
+    // Client line (the deliverable's client name, if the payload carries one).
+    var clientName = d.clientName || d.client_name || d.client || (d.client && d.client.name);
+    if (clientName) {
+      card.appendChild(el('p', { class: 'cp-note', text: 'Client: ' + clientName }));
+    }
+
+    if (d.approvedAt || d.approval_date) {
+      card.appendChild(el('p', { class: 'cp-note', text: 'Approved on ' + formatDate(d.approvedAt || d.approval_date) }));
+    }
+
+    // ── Design image previews ─────────────────────────────────────
+    // Prefer the assets array (same as website-design). If absent, fall
+    // back to whatever image fields the row exposes.
+    var assets = Array.isArray(d.assets) ? d.assets : [];
+    var imageAssets = assets.filter(function (a) {
+      return a && a.url && ((a.mimeType && a.mimeType.indexOf('image/') === 0) || looksLikeImage(a.url));
+    });
+
+    var imageUrls = imageAssets.map(function (a) { return assetUrl(a.url); });
+
+    if (!imageUrls.length) {
+      // Fallback: design-image / generic image fields on the row or meta.
+      var raw = []
+        .concat(d.designImages || d.design_images || meta.designImages || meta.design_images || [])
+        .concat(d.images || meta.images || [])
+        .concat(d.imageUrl ? [d.imageUrl] : [])
+        .concat(d.image_url ? [d.image_url] : [])
+        .concat(d.image ? [d.image] : []);
+      raw.forEach(function (it) {
+        if (!it) return;
+        var u = typeof it === 'string' ? it : (it.url || it.src || '');
+        if (u) imageUrls.push(assetUrl(u));
+      });
+    }
+
+    if (!imageUrls.length) {
+      card.appendChild(el('p', { class: 'cp-note', text: 'No designs to preview yet.' }));
+    } else {
+      var grid = el('div', { class: 'cp-wd-grid' });
+      imageUrls.forEach(function (full) {
+        var thumb = el('img', {
+          class: 'cp-wd-thumb',
+          src: full,
+          alt: 'Design preview',
+          loading: 'lazy',
+        });
+        thumb.addEventListener('click', function () {
+          openImageLightbox(imageUrls, imageUrls.indexOf(full));
+        });
+        grid.appendChild(thumb);
+      });
+      card.appendChild(grid);
+    }
+
+    // ── Actions ───────────────────────────────────────────────────
+    if (approved) {
+      card.appendChild(el('div', { class: 'cp-wd-approved-note' }, [
+        el('span', { class: 'cp-post-approved-tag', text: '✓ Approved' }),
+      ]));
+      return card;
+    }
+
+    var warn = el('div', { class: 'cp-warn', hidden: true });
+    var crBox = el('textarea', { class: 'cp-textarea', placeholder: 'Describe the changes you would like…' });
+    var crWrap = el('div', { class: 'cp-wd-cr', hidden: true }, [
+      el('div', { class: 'cp-editor-label', text: 'Request changes' }),
+      crBox,
+    ]);
+
+    // Optional screenshot upload (mirrors the website-design pattern).
+    var fileInput = el('input', { class: 'cp-input', type: 'file', accept: 'image/*' });
+    crWrap.appendChild(el('div', { class: 'cp-editor-label', text: 'Attach a screenshot (optional)' }));
+    crWrap.appendChild(fileInput);
+    crWrap.appendChild(warn);
+
+    var actions = el('div', { class: 'cp-actions' });
+
+    var approveBtn = el('button', { class: 'cp-btn cp-btn-approve', type: 'button', text: 'Approve' });
+    approveBtn.addEventListener('click', function () {
+      approveAgri4allProduct(portalToken, d, approveBtn);
+    });
+
+    var changeBtn = el('button', { class: 'cp-btn cp-btn-primary', type: 'button', text: 'Request changes' });
+    var sendBtn = el('button', { class: 'cp-btn cp-btn-primary', type: 'button', text: 'Send change request', hidden: true });
+
+    changeBtn.addEventListener('click', function () {
+      crWrap.hidden = false;
+      changeBtn.hidden = true;
+      sendBtn.hidden = false;
+      crBox.focus();
+    });
+
+    sendBtn.addEventListener('click', function () {
+      submitAgri4allProductChange(portalToken, d, crBox, fileInput, sendBtn, warn);
+    });
+
+    actions.appendChild(approveBtn);
+    actions.appendChild(changeBtn);
+    actions.appendChild(sendBtn);
+    card.appendChild(actions);
+
+    card.appendChild(crWrap);
+    return card;
+  }
+
+  // Whole-deliverable approve (no postIndex) — same helper shape as the
+  // website-design card.
+  function approveAgri4allProduct(portalToken, d, btn) {
+    if (btn) { btn.disabled = true; btn.textContent = 'Approving…'; }
+    api('POST', '/api/request-forms/public/portal/approve', {
+      deliverableId: d.id,
+    }).then(function (res) {
+      if (res.ok) {
+        loadApprovals(currentRoute().token || portalToken);
+      } else if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Approve';
+        alert((res.data && res.data.error) || 'Could not approve. Please try again.');
+      }
+    }).catch(function () {
+      if (btn) { btn.disabled = false; btn.textContent = 'Approve'; }
+      alert('Could not approve. Please try again.');
+    });
+  }
+
+  // Change request (textarea + optional screenshot) — handles 409 limit.
+  function submitAgri4allProductChange(portalToken, d, crBox, fileInput, btn, warn) {
     warn.hidden = true;
     var body = (crBox.value || '').trim();
     if (!body) {
