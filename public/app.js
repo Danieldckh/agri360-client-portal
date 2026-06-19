@@ -378,11 +378,17 @@
         return;
       }
 
-      // Agri4All product-upload design approvals get their own card
-      // (status 'sent_for_approval' → design approval), mirroring the
-      // website-design whole-deliverable approve / change-request flow.
+      // Agri4All product-upload approvals get their own card(s). The same
+      // deliverable type reaches the client at TWO different statuses, so
+      // we branch on the row's status:
+      //   • 'sent_for_approval' → DESIGN approval (shows the design image)
+      //   • 'agri4all-links'    → LIVE-LINKS approval (shows live listings)
       if (isAgri4allProductUploads(d)) {
-        wrap.appendChild(renderAgri4allProductCard(portalToken, d));
+        if (d.status === 'agri4all-links') {
+          wrap.appendChild(renderAgri4allLinksCard(portalToken, d));
+        } else {
+          wrap.appendChild(renderAgri4allProductCard(portalToken, d));
+        }
         return;
       }
 
@@ -942,6 +948,130 @@
     } else {
       send([]);
     }
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // AGRI4ALL PRODUCT-UPLOADS LIVE-LINKS APPROVAL CARD
+  //   (type === 'agri4all-product-uploads', status === 'agri4all-links')
+  // ════════════════════════════════════════════════════════════════
+  // The SECOND approval round. After the design is signed off, the team
+  // publishes the product to Agri4All per country; the CRM then returns the
+  // row at status 'agri4all-links' carrying a `previewLinks` array:
+  //   [{ country, public_url, agri4all_status }]
+  // This card shows the live preview links (one row per country) instead of
+  // a design image, then offers the same whole-deliverable Approve /
+  // Request-changes flow (description-level, with 409 limit handling).
+  function renderAgri4allLinksCard(portalToken, d) {
+    var meta = metaOf(d);
+    var status = d.status || '';
+    var approved = status === 'approved' || !!d.approvedAt || !!d.approval_date;
+
+    var head = el('div', { class: 'cp-card-head' }, [
+      el('div', {}, [
+        el('h2', { class: 'cp-card-title', text: d.title || d.name || 'Product Listing' }),
+        el('div', { class: 'cp-wd-round', text: 'Live listing approval' }),
+      ]),
+      approved
+        ? el('span', { class: 'cp-badge cp-badge-approved', text: 'Approved' })
+        : el('span', { class: 'cp-badge cp-badge-action', text: 'Approval required' }),
+    ]);
+
+    var card = el('div', { class: 'cp-card ' + (approved ? 'cp-card-approved' : 'cp-card-action') }, [head]);
+
+    // Client line (the deliverable's client name, if the payload carries one).
+    var clientName = d.clientName || d.client_name || d.client || (d.client && d.client.name);
+    if (clientName) {
+      card.appendChild(el('p', { class: 'cp-note', text: 'Client: ' + clientName }));
+    }
+
+    if (d.approvedAt || d.approval_date) {
+      card.appendChild(el('p', { class: 'cp-note', text: 'Approved on ' + formatDate(d.approvedAt || d.approval_date) }));
+    }
+
+    // ── Live preview links (one row per country) ──────────────────
+    var links = Array.isArray(d.previewLinks) ? d.previewLinks
+      : (Array.isArray(meta.previewLinks) ? meta.previewLinks : []);
+
+    if (!links.length) {
+      card.appendChild(el('p', { class: 'cp-note', text: 'No live listings to review yet.' }));
+    } else {
+      var list = el('div', { class: 'cp-links' });
+      links.forEach(function (lk) {
+        if (!lk) return;
+        var country = lk.country || lk.countryCode || lk.country_code || '';
+        var url = lk.public_url || lk.publicUrl || lk.url || '';
+        var lstatus = lk.agri4all_status || lk.agri4allStatus || lk.status || '';
+        var statusApproved = isApprovedStatus(lstatus);
+
+        var row = el('div', { class: 'cp-link-row' }, [
+          el('span', { class: 'cp-link-country', text: country || '—' }),
+          url
+            ? el('a', {
+                class: 'cp-link-live', href: assetUrl(url),
+                target: '_blank', rel: 'noopener', text: 'View live listing',
+              })
+            : el('span', { class: 'cp-note', text: 'No link yet' }),
+          el('span', {
+            class: 'cp-badge ' + (statusApproved ? 'cp-badge-approved' : 'cp-badge-action') + ' cp-badge-sm',
+            text: lstatus || 'pending',
+          }),
+        ]);
+        list.appendChild(row);
+      });
+      card.appendChild(list);
+    }
+
+    // ── Actions ───────────────────────────────────────────────────
+    if (approved) {
+      card.appendChild(el('div', { class: 'cp-wd-approved-note' }, [
+        el('span', { class: 'cp-post-approved-tag', text: '✓ Approved' }),
+      ]));
+      return card;
+    }
+
+    var warn = el('div', { class: 'cp-warn', hidden: true });
+    var crBox = el('textarea', { class: 'cp-textarea', placeholder: 'Describe the changes you would like…' });
+    var crWrap = el('div', { class: 'cp-wd-cr', hidden: true }, [
+      el('div', { class: 'cp-editor-label', text: 'Request changes' }),
+      crBox,
+    ]);
+
+    // Optional screenshot upload (mirrors the design-approval pattern).
+    var fileInput = el('input', { class: 'cp-input', type: 'file', accept: 'image/*' });
+    crWrap.appendChild(el('div', { class: 'cp-editor-label', text: 'Attach a screenshot (optional)' }));
+    crWrap.appendChild(fileInput);
+    crWrap.appendChild(warn);
+
+    var actions = el('div', { class: 'cp-actions' });
+
+    var approveBtn = el('button', { class: 'cp-btn cp-btn-approve', type: 'button', text: 'Approve' });
+    approveBtn.addEventListener('click', function () {
+      // Same whole-deliverable approve helper as the other approve cards.
+      approveAgri4allProduct(portalToken, d, approveBtn);
+    });
+
+    var changeBtn = el('button', { class: 'cp-btn cp-btn-primary', type: 'button', text: 'Request changes' });
+    var sendBtn = el('button', { class: 'cp-btn cp-btn-primary', type: 'button', text: 'Send change request', hidden: true });
+
+    changeBtn.addEventListener('click', function () {
+      crWrap.hidden = false;
+      changeBtn.hidden = true;
+      sendBtn.hidden = false;
+      crBox.focus();
+    });
+
+    sendBtn.addEventListener('click', function () {
+      // Description-level change request (no postIndex) — handles the 409 limit.
+      submitAgri4allProductChange(portalToken, d, crBox, fileInput, sendBtn, warn);
+    });
+
+    actions.appendChild(approveBtn);
+    actions.appendChild(changeBtn);
+    actions.appendChild(sendBtn);
+    card.appendChild(actions);
+
+    card.appendChild(crWrap);
+    return card;
   }
 
   // Simple image lightbox (reuses the overlay shell). Pages through `urls`.
