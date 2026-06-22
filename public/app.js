@@ -348,6 +348,23 @@
   }
   function isWebsiteDesign(d) { return d && d.type === 'website-design'; }
   function isAgri4allProductUploads(d) { return d && d.type === 'agri4all-product-uploads'; }
+  function isVideo(d) { return d && d.type === 'video'; }
+  function looksLikeVideo(u) { return /\.(mp4|mov|m4v|webm|ogg|ogv)(\?|#|$)/i.test(String(u || '')); }
+  // The video deliverable carries the cut in metadata.video_upload. toCamelCase
+  // does NOT recurse into the metadata JSONB blob, so the nested key arrives
+  // exactly as the CRM writes it — read both snake and camel forms defensively.
+  function videoUploadOf(d) {
+    var meta = metaOf(d);
+    var vu = meta.video_upload || meta.videoUpload || null;
+    if (!vu || typeof vu !== 'object') return null;
+    var url = vu.url || vu.path || vu.src || '';
+    if (!url) return null;
+    return {
+      url: url,
+      name: vu.name || vu.filename || vu.title || '',
+      mimeType: vu.mimeType || vu.mime_type || vu.type || '',
+    };
+  }
   function looksLikeImage(u) { return /\.(png|jpe?g|gif|webp|avif|svg|bmp)(\?|#|$)/i.test(String(u || '')); }
   function looksLikePdf(u) { return /\.pdf(\?|#|$)/i.test(String(u || '')); }
   function metaOf(d) {
@@ -375,6 +392,13 @@
       // per-post path below is left fully intact.
       if (isWebsiteDesign(d)) {
         wrap.appendChild(renderWebsiteDesignCard(portalToken, d));
+        return;
+      }
+
+      // Video deliverables get a dedicated approval card: an embedded HTML5
+      // player for the cut + whole-deliverable Approve / Request-changes.
+      if (isVideo(d)) {
+        wrap.appendChild(renderVideoCard(portalToken, d));
         return;
       }
 
@@ -746,6 +770,153 @@
     } else {
       send([]);
     }
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // VIDEO APPROVAL CARD  (type === 'video')
+  // ════════════════════════════════════════════════════════════════
+  // The video department sends the finished cut to the client at status
+  // 'sent_for_approval'. The deliverable carries the upload in
+  // metadata.video_upload = { url, name, mimeType }. This card mirrors the
+  // website-design whole-row approval card: it shows the title/client/month,
+  // an embedded HTML5 <video controls> player, and Approve / Request-changes
+  // (3-round cap). The change-request reuses the same whole-deliverable
+  // helpers as the website-design card (no postIndex):
+  //   • Approve         → POST /approve { deliverableId }   (→ approved)
+  //   • Request changes → POST /change-request { deliverableId, body,
+  //                          screenshots }                  (→ changes_requested)
+  function renderVideoCard(portalToken, d) {
+    var meta = metaOf(d);
+    var status = d.status || '';
+    // Once approved (or already moved past sent_for_approval) the row shows a
+    // read-only approved state. changes_requested means the team is re-editing,
+    // so it won't appear in the approvals list at all.
+    var approved = status === 'approved' || status === 'complete' || !!d.approvedAt || !!d.approval_date;
+
+    var head = el('div', { class: 'cp-card-head' }, [
+      el('div', {}, [
+        el('h2', { class: 'cp-card-title', text: d.title || d.name || 'Video' }),
+        el('div', { class: 'cp-wd-round', text: 'Video approval' }),
+      ]),
+      approved
+        ? el('span', { class: 'cp-badge cp-badge-approved', text: 'Approved' })
+        : el('span', { class: 'cp-badge cp-badge-action', text: 'Approval required' }),
+    ]);
+
+    var card = el('div', { class: 'cp-card ' + (approved ? 'cp-card-approved' : 'cp-card-action') }, [head]);
+
+    // Client + month context line (mirrors the other cards).
+    var clientName = d.clientName || d.client_name || d.client || (d.client && d.client.name);
+    var month = d.deliveryMonth || d.delivery_month || '';
+    var ctxBits = [];
+    if (clientName) ctxBits.push('Client: ' + clientName);
+    if (month) ctxBits.push(formatMonth(month));
+    if (ctxBits.length) {
+      card.appendChild(el('p', { class: 'cp-note', text: ctxBits.join('  ·  ') }));
+    }
+
+    if (d.approvedAt || d.approval_date) {
+      card.appendChild(el('p', { class: 'cp-note', text: 'Approved on ' + formatDate(d.approvedAt || d.approval_date) }));
+    }
+
+    // ── Player ────────────────────────────────────────────────────
+    // Defensive: if no upload yet, show a notice instead of a broken player.
+    var upload = videoUploadOf(d);
+    if (!upload) {
+      card.appendChild(el('div', { class: 'cp-video-missing' }, [
+        el('div', { class: 'cp-video-missing-icon', text: '🎬' }),
+        el('p', { class: 'cp-note', text: 'The video is not yet uploaded. Please check back shortly.' }),
+      ]));
+    } else {
+      var src = assetUrl(upload.url); // relative /uploads/… → same-origin via portal proxy
+      var sourceAttrs = { src: src };
+      if (upload.mimeType) sourceAttrs.type = upload.mimeType;
+      var video = el('video', {
+        class: 'cp-video-player',
+        controls: true,
+        preload: 'metadata',
+        playsinline: true,
+        controlslist: 'nodownload',
+      }, [
+        el('source', sourceAttrs),
+        document.createTextNode('Your browser cannot play this video. '),
+      ]);
+      // Fallback open-in-new-tab link (also lets the client see it if the inline
+      // codec is unsupported).
+      var openLink = el('a', { class: 'cp-btn', href: src, target: '_blank', rel: 'noopener', text: 'Open video in new tab' });
+      card.appendChild(el('div', { class: 'cp-video-wrap' }, [video]));
+      if (upload.name) {
+        card.appendChild(el('div', { class: 'cp-wd-filelabel', text: upload.name }));
+      }
+      card.appendChild(el('div', { class: 'cp-wd-fileactions' }, [openLink]));
+    }
+
+    // ── Actions ───────────────────────────────────────────────────
+    if (approved) {
+      card.appendChild(el('div', { class: 'cp-wd-approved-note' }, [
+        el('span', { class: 'cp-post-approved-tag', text: '✓ Approved' }),
+      ]));
+      return card;
+    }
+
+    // No actions until there's something to review.
+    if (!upload) return card;
+
+    var roundsUsed = parseInt(meta.changeRequestRoundsUsed, 10) || 0;
+    var roundsLeft = Math.max(0, 3 - roundsUsed);
+
+    var warn = el('div', { class: 'cp-warn', hidden: true });
+    var crBox = el('textarea', { class: 'cp-textarea', placeholder: 'Describe the changes you would like…' });
+    var crWrap = el('div', { class: 'cp-wd-cr', hidden: true }, [
+      el('div', { class: 'cp-editor-label', text: 'Request changes' }),
+      crBox,
+    ]);
+
+    // Optional screenshot upload (mirrors the website-design change-request).
+    var fileInput = el('input', { class: 'cp-input', type: 'file', accept: 'image/*' });
+    crWrap.appendChild(el('div', { class: 'cp-editor-label', text: 'Attach a screenshot (optional)' }));
+    crWrap.appendChild(fileInput);
+    crWrap.appendChild(warn);
+
+    var actions = el('div', { class: 'cp-actions' });
+
+    var approveBtn = el('button', { class: 'cp-btn cp-btn-approve', type: 'button', text: 'Approve' });
+    approveBtn.addEventListener('click', function () {
+      // Whole-deliverable approve — identical body to website-design.
+      approveWebsiteDesign(portalToken, d, approveBtn);
+    });
+
+    var changeBtn = el('button', { class: 'cp-btn cp-btn-primary', type: 'button', text: 'Request changes' });
+    var sendBtn = el('button', { class: 'cp-btn cp-btn-primary', type: 'button', text: 'Send change request', hidden: true });
+
+    if (roundsLeft <= 0) {
+      changeBtn.disabled = true;
+      changeBtn.textContent = 'No change rounds left';
+    }
+
+    changeBtn.addEventListener('click', function () {
+      crWrap.hidden = false;
+      changeBtn.hidden = true;
+      sendBtn.hidden = false;
+      crBox.focus();
+    });
+
+    sendBtn.addEventListener('click', function () {
+      // Whole-deliverable change request — identical to website-design.
+      submitWebsiteDesignChange(portalToken, d, crBox, fileInput, sendBtn, warn);
+    });
+
+    actions.appendChild(approveBtn);
+    actions.appendChild(changeBtn);
+    actions.appendChild(sendBtn);
+    card.appendChild(actions);
+
+    if (roundsUsed > 0) {
+      card.appendChild(el('p', { class: 'cp-note', text: roundsLeft + ' change round' + (roundsLeft === 1 ? '' : 's') + ' left.' }));
+    }
+
+    card.appendChild(crWrap);
+    return card;
   }
 
   // ════════════════════════════════════════════════════════════════
@@ -1242,6 +1413,18 @@
     var d = new Date(v);
     if (isNaN(d.getTime())) return String(v);
     return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  }
+
+  // delivery_month is usually a 'YYYY-MM' (or 'YYYY-MM-DD') string. Render as
+  // "Mon YYYY"; fall back to the raw value if it isn't parseable.
+  function formatMonth(v) {
+    if (!v) return '';
+    var m = String(v).match(/^(\d{4})-(\d{2})/);
+    if (m) {
+      var dt = new Date(Number(m[1]), Number(m[2]) - 1, 1);
+      if (!isNaN(dt.getTime())) return dt.toLocaleDateString(undefined, { year: 'numeric', month: 'short' });
+    }
+    return String(v);
   }
 
   // ── Router (path-based, with hash fallback) ──────────────────────

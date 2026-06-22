@@ -86,7 +86,13 @@ app.all('/api/*', async (req, res) => {
  */
 // Allowlist of content-types safe to serve inline on our own origin (cannot
 // execute script). Anything else (svg/html/xml/…) is forced to a download.
-var UPLOAD_INLINE_TYPES = ['application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+// Inline images/PDFs (preview thumbs) plus video (the client-portal video
+// approval player). None of these can execute script, so serving them inline on
+// our own origin is safe under the same model as the image/PDF allowlist.
+var UPLOAD_INLINE_TYPES = [
+  'application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp',
+  'video/mp4', 'video/quicktime', 'video/webm', 'video/ogg', 'video/x-m4v',
+];
 app.get('/uploads/*', async (req, res) => {
   // Validate the path: only /uploads/<safe segments>, no traversal / encoded
   // traversal / backslashes — so it can never be rewritten to another CRM route
@@ -102,12 +108,21 @@ app.get('/uploads/*', async (req, res) => {
     return res.status(400).end();
   }
   try {
-    const upstream = await fetch(targetUrl.href, { method: 'GET', headers: { 'X-Portal-Key': PORTAL_KEY } });
+    // Forward the browser's Range header so <video> seeking works (the upstream
+    // returns 206 + Content-Range, which we pass through verbatim).
+    const upstreamHeaders = { 'X-Portal-Key': PORTAL_KEY };
+    if (req.headers.range) upstreamHeaders['Range'] = req.headers.range;
+    const upstream = await fetch(targetUrl.href, { method: 'GET', headers: upstreamHeaders });
     res.status(upstream.status);
     res.set('X-Content-Type-Options', 'nosniff');
+    // Pass through the headers a media player needs for seeking / progress.
+    ['accept-ranges', 'content-range', 'content-length'].forEach(function (h) {
+      var v = upstream.headers.get(h);
+      if (v) res.set(h, v);
+    });
     var ct = (upstream.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
     if (UPLOAD_INLINE_TYPES.indexOf(ct) !== -1) {
-      res.set('Content-Type', ct); // safe to render inline (pdf preview / image thumbs)
+      res.set('Content-Type', ct); // safe to render inline (pdf preview / image thumbs / video player)
     } else {
       // Never serve attacker-influenced types (svg/html/xml) inline on our origin.
       res.set('Content-Type', 'application/octet-stream');
