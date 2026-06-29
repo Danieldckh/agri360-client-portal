@@ -349,6 +349,7 @@
   function isWebsiteDesign(d) { return d && d.type === 'website-design'; }
   function isAgri4allProductUploads(d) { return d && d.type === 'agri4all-product-uploads'; }
   function isVideo(d) { return d && d.type === 'video'; }
+  function isMagazine(d) { return d && d.type === 'magazine'; }
   function looksLikeVideo(u) { return /\.(mp4|mov|m4v|webm|ogg|ogv)(\?|#|$)/i.test(String(u || '')); }
   // The video deliverable carries the cut in metadata.video_upload. toCamelCase
   // does NOT recurse into the metadata JSONB blob, so the nested key arrives
@@ -413,6 +414,14 @@
         } else {
           wrap.appendChild(renderAgri4allProductCard(portalToken, d));
         }
+        return;
+      }
+
+      // Magazine print-ad / print-article deliverables get a dedicated card
+      // with a publication pill (static when resolved, selectable when the
+      // 'Print Ad / Print Article' choice is still undecided).
+      if (isMagazine(d)) {
+        wrap.appendChild(renderMagazineCard(portalToken, d));
         return;
       }
 
@@ -1243,6 +1252,161 @@
 
     card.appendChild(crWrap);
     return card;
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // MAGAZINE APPROVAL CARD  (type === 'magazine')
+  // ════════════════════════════════════════════════════════════════
+  // Print-ad / print-article rows. The publication may already be resolved
+  // ('Print Ad' or 'Print Article') — shown as a static, read-only pill — or
+  // still undecided ('Print Ad / Print Article'), in which case the client
+  // chooses one via a two-option toggle (no default selected) before the row
+  // can be approved. Design previews come from metadata.items[].images, with a
+  // fallback to the metadata.posts media. Approve posts the chosen publication
+  // (no postIndex), then refreshes the list.
+  function renderMagazineCard(portalToken, d) {
+    var meta = metaOf(d);
+    var status = d.status || '';
+    var approved = status === 'approved' || !!d.approvedAt || !!d.approval_date;
+
+    var publication = meta.publication || '';
+    var resolved = publication === 'Print Ad' || publication === 'Print Article';
+    var undecided = !resolved;
+
+    var head = el('div', { class: 'cp-card-head' }, [
+      el('div', {}, [
+        el('h2', { class: 'cp-card-title', text: d.title || d.name || 'Magazine' }),
+        el('div', { class: 'cp-wd-round', text: 'Magazine approval' }),
+      ]),
+      approved
+        ? el('span', { class: 'cp-badge cp-badge-approved', text: 'Approved' })
+        : el('span', { class: 'cp-badge cp-badge-action', text: 'Approval required' }),
+    ]);
+
+    var card = el('div', { class: 'cp-card ' + (approved ? 'cp-card-approved' : 'cp-card-action') }, [head]);
+
+    // Client + month context line (mirrors the video / agri4all cards).
+    var clientName = d.clientName || d.client_name || d.client || (d.client && d.client.name);
+    var month = d.deliveryMonth || d.delivery_month || '';
+    var ctxBits = [];
+    if (clientName) ctxBits.push('Client: ' + clientName);
+    if (month) ctxBits.push(formatMonth(month));
+    if (ctxBits.length) {
+      card.appendChild(el('p', { class: 'cp-note', text: ctxBits.join('  ·  ') }));
+    }
+
+    if (d.approvedAt || d.approval_date) {
+      card.appendChild(el('p', { class: 'cp-note', text: 'Approved on ' + formatDate(d.approvedAt || d.approval_date) }));
+    }
+
+    // ── Design previews ───────────────────────────────────────────
+    var imageUrls = magazineDesignImages(d);
+    if (!imageUrls.length) {
+      card.appendChild(el('p', { class: 'cp-note', text: 'No designs to preview yet.' }));
+    } else {
+      var grid = el('div', { class: 'cp-wd-grid' });
+      imageUrls.forEach(function (full) {
+        var thumb = el('img', {
+          class: 'cp-wd-thumb',
+          src: full,
+          alt: 'Design preview',
+          loading: 'lazy',
+        });
+        thumb.addEventListener('click', function () {
+          openImageLightbox(imageUrls, imageUrls.indexOf(full));
+        });
+        grid.appendChild(thumb);
+      });
+      card.appendChild(grid);
+    }
+
+    // ── Publication pill / toggle ─────────────────────────────────
+    // chosenPublication is the value sent on approve. Resolved rows carry it
+    // straight through; undecided rows start null until the client picks.
+    var chosenPublication = resolved ? publication : null;
+    var approveBtn = el('button', { class: 'cp-btn cp-btn-approve', type: 'button', text: 'Approve' });
+
+    var pubWrap = el('div', { class: 'cp-pub' });
+    pubWrap.appendChild(el('div', { class: 'cp-editor-label', text: 'Publication' }));
+
+    if (resolved) {
+      // Static, read-only pill with the resolved label.
+      pubWrap.appendChild(el('span', { class: 'cp-pill', text: publication }));
+    } else {
+      // Selectable two-option toggle, nothing selected by default.
+      var toggle = el('div', { class: 'cp-pill-toggle' });
+      ['Print Ad', 'Print Article'].forEach(function (opt) {
+        var optBtn = el('button', { class: 'cp-pill-option', type: 'button', text: opt });
+        optBtn.addEventListener('click', function () {
+          chosenPublication = opt;
+          Array.prototype.slice.call(toggle.querySelectorAll('.cp-pill-option')).forEach(function (b) {
+            b.classList.toggle('selected', b === optBtn);
+          });
+          if (!approved) approveBtn.disabled = false;
+        });
+        toggle.appendChild(optBtn);
+      });
+      pubWrap.appendChild(toggle);
+      pubWrap.appendChild(el('div', { class: 'cp-pill-hint', text: 'Required: choose one before approving.' }));
+    }
+    card.appendChild(pubWrap);
+
+    // ── Actions ───────────────────────────────────────────────────
+    if (approved) {
+      card.appendChild(el('div', { class: 'cp-wd-approved-note' }, [
+        el('span', { class: 'cp-post-approved-tag', text: '✓ Approved' }),
+      ]));
+      return card;
+    }
+
+    // Keep Approve disabled until an undecided row's publication is chosen.
+    if (undecided) approveBtn.disabled = true;
+    approveBtn.addEventListener('click', function () {
+      if (undecided && !chosenPublication) return;
+      approveMagazine(portalToken, d, chosenPublication, approveBtn);
+    });
+
+    card.appendChild(el('div', { class: 'cp-actions' }, [approveBtn]));
+    return card;
+  }
+
+  // Collect design preview image URLs for a magazine deliverable: prefer the
+  // metadata.items[].images arrays; fall back to the metadata.posts media.
+  function magazineDesignImages(d) {
+    var meta = metaOf(d);
+    var urls = [];
+    var items = Array.isArray(meta.items) ? meta.items : [];
+    items.forEach(function (it) {
+      var imgs = it && Array.isArray(it.images) ? it.images : (it && it.image ? [it.image] : []);
+      imgs.forEach(function (u) { if (u) urls.push(assetUrl(u)); });
+    });
+    if (!urls.length) {
+      mediaPosts(d).forEach(function (mp) {
+        mp.images.forEach(function (u) { if (u) urls.push(assetUrl(u)); });
+      });
+    }
+    return urls;
+  }
+
+  // Whole-deliverable approve for a magazine row. Sends the chosen publication
+  // only when present (undecided rows MUST pass one; resolved rows pass their
+  // existing value), then refreshes the approvals list.
+  function approveMagazine(portalToken, d, publication, btn) {
+    if (btn) { btn.disabled = true; btn.textContent = 'Approving…'; }
+    var body = { deliverableId: d.id };
+    if (publication) body.publication = publication;
+    api('POST', '/api/request-forms/public/portal/approve', body).then(function (res) {
+      if (res.ok) {
+        loadApprovals(currentRoute().token || portalToken);
+      } else if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Approve';
+        alert((res.data && res.data.error) || 'Could not approve. Please try again.');
+      }
+    }).catch(function () {
+      if (btn) { btn.disabled = false; btn.textContent = 'Approve'; }
+      alert('Could not approve. Please try again.');
+    });
   }
 
   // Simple image lightbox (reuses the overlay shell). Pages through `urls`.
