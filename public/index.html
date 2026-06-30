@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ProAgri Client Portal</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="cp-header">
+    <div class="cp-header-inner">
+      <div class="cp-brand">
+        <span class="cp-wordmark"><span class="pro">Pro</span><span class="agri">Agri</span></span>
+        <span class="cp-page-title">Client Portal</span>
+      </div>
+    </div>
+  </header>
+
+  <main id="app" class="cp-main">
+    <div class="cp-loading">Loading…</div>
+  </main>
+
+  <footer class="cp-footer">
+    <span>ProAgri Media — Client Portal</span>
+  </footer>
+
+  <!-- Lightbox / detail overlay -->
+  <div id="overlay" class="cp-overlay" hidden></div>
+
+  <!-- Native video-request form: action-required dialog used by form-render.js. -->
+  <dialog id="popup" class="cp-vrf-popup">
+    <div class="cp-vrf-popup-body">
+      <h3>Action required</h3>
+      <p id="popupMsg">Please complete the highlighted fields.</p>
+      <div class="cp-vrf-popup-actions">
+        <button type="button" id="popupClose">OK</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Schema-driven render engine — native cp- styling (no Tailwind). -->
+  <script src="/form-render.js"></script>
+  <script src="/app.js"></script>
+  <script src="https://agri360.proagrihub.com/feedback-widget.embed.js" data-app="client-portal" defer></script>
+</body>
+</html>
