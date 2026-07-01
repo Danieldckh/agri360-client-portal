@@ -426,6 +426,52 @@ body {
   margin-top: 8px;
 }
 
+/* ── Design-collateral approval card ── */
+.cp-coll-section { margin: 20px 0 4px; }
+.cp-coll-section-title {
+  font-size: 15px; font-weight: 700; margin: 0;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--cp-border);
+  color: var(--cp-text);
+}
+.cp-coll-card-title {
+  font-size: 12px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--cp-text-muted);
+  margin: 14px 0 6px;
+}
+.cp-coll-media, .cp-coll-desc, .cp-coll-details { margin-top: 4px; }
+.cp-coll-desc-body {
+  white-space: pre-line;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--cp-text);
+}
+.cp-coll-dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 16px;
+  margin: 6px 0 0;
+}
+.cp-coll-dt {
+  font-size: 12px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--cp-text-muted);
+}
+.cp-coll-dd { margin: 0; font-size: 14px; color: var(--cp-text); }
+.cp-coll-actions { margin-top: 4px; }
+
+/* ── Read-only preview banner (/preview/:itemId) ── */
+.cp-preview-banner {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  border-radius: 10px;
+  border: 1px dashed var(--cp-border-strong);
+  background: var(--cp-surface-2);
+  color: var(--cp-text-muted);
+  font-size: 13px; font-weight: 600;
+}
+.cp-preview-banner::before { content: '👁'; font-size: 15px; }
+
 /* ── Image lightbox ── */
 .cp-lightbox {
   position: relative;

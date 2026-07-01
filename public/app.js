@@ -403,6 +403,14 @@
     }
 
     items.forEach(function (d) {
+      // Design-collateral rows carry their own client-facing approval layout
+      // (item.approvalLayout). Branch on kind BEFORE the type checks so the
+      // configurable card renderer takes precedence over any type heuristics.
+      if (d.kind === 'collateral') {
+        wrap.appendChild(renderCollateralCard(portalToken, d));
+        return;
+      }
+
       // Website-design deliverables get a dedicated approval card; the CC
       // per-post path below is left fully intact.
       if (isWebsiteDesign(d)) {
@@ -1423,6 +1431,370 @@
     });
   }
 
+  // ════════════════════════════════════════════════════════════════
+  // DESIGN-COLLATERAL APPROVAL CARD  (item.kind === 'collateral')
+  // ════════════════════════════════════════════════════════════════
+  // Unlike the other cards (which hard-code their layout per deliverable
+  // type), a collateral row carries its OWN client-facing layout in
+  // item.approvalLayout — an ordered list of blocks the CRM builder produced:
+  //   { id, kind:'section', title }
+  //   { id, kind:'card', cardType, title, config }
+  // cardType ∈ 'media_gallery' | 'description' | 'item_details' | 'approval_actions'.
+  // Media come from metadata.files = [{ name, url }]; notes/description from
+  // metadata.notes / metadata.description. When approvalLayout is empty we fall
+  // back to a sensible DEFAULT (item details → media gallery → approval actions).
+  //
+  // The same renderer serves the live approvals list AND the read-only /preview
+  // route: pass opts.preview to disable Approve / Request-changes.
+  function renderCollateralCard(portalToken, item, opts) {
+    opts = opts || {};
+    var preview = !!opts.preview;
+    var meta = metaOf(item);
+    var portalState = meta.portalState || meta.portal_state || '';
+    var approved = portalState === 'approved' || item.currentStatus === 'approved' || item.status === 'approved';
+
+    var head = el('div', { class: 'cp-card-head' }, [
+      el('div', {}, [
+        el('h2', { class: 'cp-card-title', text: item.name || item.title || 'Design Collateral' }),
+        el('div', { class: 'cp-wd-round', text: 'Collateral approval' }),
+      ]),
+      approved
+        ? el('span', { class: 'cp-badge cp-badge-approved', text: 'Approved' })
+        : el('span', { class: 'cp-badge cp-badge-action', text: 'Approval required' }),
+    ]);
+
+    var card = el('div', { class: 'cp-card ' + (approved ? 'cp-card-approved' : 'cp-card-action') }, [head]);
+
+    // Ordered blocks from the builder; fall back to a default layout.
+    var layout = Array.isArray(item.approvalLayout) ? item.approvalLayout : [];
+    if (!layout.length) {
+      layout = [
+        { kind: 'card', cardType: 'item_details', title: 'Details' },
+        { kind: 'card', cardType: 'media_gallery', title: 'Media' },
+        { kind: 'card', cardType: 'approval_actions', title: '' },
+      ];
+    }
+
+    var ctx = { preview: preview, approved: approved };
+    layout.forEach(function (block) {
+      var node = renderCollateralBlock(portalToken, item, block, ctx);
+      if (node) card.appendChild(node);
+    });
+
+    return card;
+  }
+
+  function renderCollateralBlock(portalToken, item, block, ctx) {
+    if (!block) return null;
+    if (block.kind === 'section') {
+      return el('div', { class: 'cp-coll-section' }, [
+        el('h3', { class: 'cp-coll-section-title', text: block.title || '' }),
+      ]);
+    }
+    if (block.kind === 'card') {
+      switch (block.cardType) {
+        case 'media_gallery': return renderCollateralMedia(item, block.title);
+        case 'description': return renderCollateralDescription(item, block.title);
+        case 'item_details': return renderCollateralDetails(item, block.title);
+        case 'approval_actions': return renderCollateralActions(portalToken, item, ctx);
+        default: return null;
+      }
+    }
+    return null;
+  }
+
+  // Small helper: an optional card sub-title above a collateral block.
+  function collCardTitle(title) {
+    return title ? el('div', { class: 'cp-coll-card-title', text: title }) : null;
+  }
+
+  // Media gallery — images (lightbox), videos (player), PDFs (iframe), other
+  // files (open button). Reads metadata.files = [{ name, url }].
+  function renderCollateralMedia(item, title) {
+    var meta = metaOf(item);
+    var files = Array.isArray(meta.files) ? meta.files.filter(function (f) { return f && f.url; }) : [];
+    var wrap = el('div', { class: 'cp-coll-media' });
+    var t = collCardTitle(title);
+    if (t) wrap.appendChild(t);
+
+    if (!files.length) {
+      wrap.appendChild(el('p', { class: 'cp-note', text: 'No media to preview yet.' }));
+      return wrap;
+    }
+
+    var images = files.filter(function (f) { return looksLikeImage(f.url); });
+    var videos = files.filter(function (f) { return looksLikeVideo(f.url); });
+    var pdfs = files.filter(function (f) { return looksLikePdf(f.url); });
+    var others = files.filter(function (f) {
+      return images.indexOf(f) === -1 && videos.indexOf(f) === -1 && pdfs.indexOf(f) === -1;
+    });
+
+    // Images → thumbnail grid + lightbox.
+    if (images.length) {
+      var imageUrls = images.map(function (f) { return assetUrl(f.url); });
+      var grid = el('div', { class: 'cp-wd-grid' });
+      images.forEach(function (f) {
+        var full = assetUrl(f.url);
+        var thumb = el('img', {
+          class: 'cp-wd-thumb', src: full, alt: f.name || 'Media preview',
+          loading: 'lazy', title: f.name || '',
+        });
+        thumb.addEventListener('click', function () {
+          openImageLightbox(imageUrls, imageUrls.indexOf(full));
+        });
+        grid.appendChild(thumb);
+      });
+      wrap.appendChild(grid);
+    }
+
+    // Videos → inline HTML5 player + open link.
+    videos.forEach(function (f) {
+      var src = assetUrl(f.url);
+      var video = el('video', {
+        class: 'cp-video-player', controls: true, preload: 'metadata',
+        playsinline: true, controlslist: 'nodownload',
+      }, [
+        el('source', { src: src }),
+        document.createTextNode('Your browser cannot play this video. '),
+      ]);
+      wrap.appendChild(el('div', { class: 'cp-video-wrap' }, [video]));
+      if (f.name) wrap.appendChild(el('div', { class: 'cp-wd-filelabel', text: f.name }));
+      wrap.appendChild(el('div', { class: 'cp-wd-fileactions' }, [
+        el('a', { class: 'cp-btn', href: src, target: '_blank', rel: 'noopener', text: 'Open video in new tab' }),
+      ]));
+    });
+
+    // PDFs → inline iframe + open button.
+    pdfs.forEach(function (f) {
+      var url = assetUrl(f.url);
+      var block = el('div', { class: 'cp-wd-pdf' });
+      block.appendChild(el('div', { class: 'cp-wd-filelabel', text: f.name || 'PDF' }));
+      block.appendChild(el('iframe', { class: 'cp-wd-pdf-frame', src: url, title: f.name || 'PDF' }));
+      block.appendChild(el('div', { class: 'cp-wd-fileactions' }, [
+        el('a', { class: 'cp-btn', href: url, target: '_blank', rel: 'noopener', text: 'Open PDF' }),
+      ]));
+      wrap.appendChild(block);
+    });
+
+    // Other files → open button.
+    if (others.length) {
+      var fileRow = el('div', { class: 'cp-wd-fileactions' });
+      others.forEach(function (f) {
+        fileRow.appendChild(el('a', {
+          class: 'cp-btn', href: assetUrl(f.url), target: '_blank', rel: 'noopener',
+          text: f.name ? ('Open ' + f.name) : 'Open file',
+        }));
+      });
+      wrap.appendChild(fileRow);
+    }
+
+    return wrap;
+  }
+
+  // Description — notes / description text from the metadata.
+  function renderCollateralDescription(item, title) {
+    var meta = metaOf(item);
+    var text = meta.notes || meta.description || '';
+    var wrap = el('div', { class: 'cp-coll-desc' });
+    var t = collCardTitle(title);
+    if (t) wrap.appendChild(t);
+    if (!text) {
+      wrap.appendChild(el('p', { class: 'cp-note', text: 'No description provided.' }));
+    } else {
+      // Render as plain text (preserving line breaks via CSS white-space).
+      wrap.appendChild(el('div', { class: 'cp-coll-desc-body', text: String(text) }));
+    }
+    return wrap;
+  }
+
+  // Item details — a small key/value list built from the row's own fields.
+  function renderCollateralDetails(item, title) {
+    var wrap = el('div', { class: 'cp-coll-details' });
+    var t = collCardTitle(title);
+    if (t) wrap.appendChild(t);
+
+    var clientName = item.clientName || item.client_name || (item.client && item.client.name) || '';
+    var rows = [
+      ['Name', item.name || item.title || ''],
+      ['Type', item.type || ''],
+      ['Client', clientName],
+      ['Status', item.currentStatus || item.status || ''],
+    ].filter(function (r) { return r[1]; });
+
+    if (!rows.length) {
+      wrap.appendChild(el('p', { class: 'cp-note', text: 'No details available.' }));
+      return wrap;
+    }
+
+    var list = el('dl', { class: 'cp-coll-dl' });
+    rows.forEach(function (r) {
+      list.appendChild(el('dt', { class: 'cp-coll-dt', text: r[0] }));
+      list.appendChild(el('dd', { class: 'cp-coll-dd', text: String(r[1]) }));
+    });
+    wrap.appendChild(list);
+    return wrap;
+  }
+
+  // Approval actions — Approve + Request-changes (whole-collateral), or a
+  // disabled read-only pair in preview mode. Already-approved rows show a tag.
+  function renderCollateralActions(portalToken, item, ctx) {
+    ctx = ctx || {};
+    var preview = !!ctx.preview;
+    var box = el('div', { class: 'cp-coll-actions' });
+
+    if (ctx.approved) {
+      box.appendChild(el('div', { class: 'cp-wd-approved-note' }, [
+        el('span', { class: 'cp-post-approved-tag', text: '✓ Approved' }),
+      ]));
+      return box;
+    }
+
+    var warn = el('div', { class: 'cp-warn', hidden: true });
+    var crBox = el('textarea', { class: 'cp-textarea', placeholder: 'Describe the changes you would like…' });
+    var crWrap = el('div', { class: 'cp-wd-cr', hidden: true }, [
+      el('div', { class: 'cp-editor-label', text: 'Request changes' }),
+      crBox,
+    ]);
+    var fileInput = el('input', { class: 'cp-input', type: 'file', accept: 'image/*' });
+    crWrap.appendChild(el('div', { class: 'cp-editor-label', text: 'Attach a screenshot (optional)' }));
+    crWrap.appendChild(fileInput);
+    crWrap.appendChild(warn);
+
+    var actions = el('div', { class: 'cp-actions' });
+    var approveBtn = el('button', { class: 'cp-btn cp-btn-approve', type: 'button', text: 'Approve' });
+    var changeBtn = el('button', { class: 'cp-btn cp-btn-primary', type: 'button', text: 'Request changes' });
+    var sendBtn = el('button', { class: 'cp-btn cp-btn-primary', type: 'button', text: 'Send change request', hidden: true });
+
+    if (preview) {
+      // Read-only: clients can't act from the CRM preview.
+      approveBtn.disabled = true;
+      changeBtn.disabled = true;
+      actions.appendChild(approveBtn);
+      actions.appendChild(changeBtn);
+      box.appendChild(actions);
+      box.appendChild(el('p', { class: 'cp-note', text: "Preview — clients can't act here." }));
+      return box;
+    }
+
+    approveBtn.addEventListener('click', function () {
+      approveCollateral(portalToken, item.id, approveBtn);
+    });
+    changeBtn.addEventListener('click', function () {
+      crWrap.hidden = false;
+      changeBtn.hidden = true;
+      sendBtn.hidden = false;
+      crBox.focus();
+    });
+    sendBtn.addEventListener('click', function () {
+      submitCollateralChange(portalToken, item.id, crBox, fileInput, sendBtn, warn);
+    });
+
+    actions.appendChild(approveBtn);
+    actions.appendChild(changeBtn);
+    actions.appendChild(sendBtn);
+    box.appendChild(actions);
+    box.appendChild(crWrap);
+    return box;
+  }
+
+  // Whole-collateral approve → POST /portal/approve { kind:'collateral',
+  // designCollateralId }. Refreshes the approvals list on success.
+  function approveCollateral(portalToken, designCollateralId, btn) {
+    if (btn) { btn.disabled = true; btn.textContent = 'Approving…'; }
+    api('POST', '/api/request-forms/public/portal/approve', {
+      kind: 'collateral',
+      designCollateralId: designCollateralId,
+    }).then(function (res) {
+      if (res.ok) {
+        loadApprovals(currentRoute().token || portalToken);
+      } else if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Approve';
+        alert((res.data && res.data.error) || 'Could not approve. Please try again.');
+      }
+    }).catch(function () {
+      if (btn) { btn.disabled = false; btn.textContent = 'Approve'; }
+      alert('Could not approve. Please try again.');
+    });
+  }
+
+  // Whole-collateral change request → POST /portal/change-request
+  // { kind:'collateral', designCollateralId, body, screenshots }. Handles the
+  // 409 no-rounds-left case like the other change-request helpers.
+  function submitCollateralChange(portalToken, designCollateralId, crBox, fileInput, btn, warn) {
+    warn.hidden = true;
+    var body = (crBox.value || '').trim();
+    if (!body) {
+      warn.textContent = 'Please describe the change before sending.';
+      warn.hidden = false;
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Sending…';
+
+    function send(screenshots) {
+      api('POST', '/api/request-forms/public/portal/change-request', {
+        kind: 'collateral',
+        designCollateralId: designCollateralId,
+        body: body,
+        screenshots: screenshots,
+      }).then(function (res) {
+        if (res.ok) {
+          render(thankYouState('Your change request has been sent. We will be in touch.'));
+        } else if (res.status === 409) {
+          btn.disabled = false;
+          btn.textContent = 'Send change request';
+          warn.textContent = 'No change rounds left — please approve.';
+          warn.hidden = false;
+        } else {
+          btn.disabled = false;
+          btn.textContent = 'Send change request';
+          warn.textContent = (res.data && res.data.error) || 'Could not send. Please try again.';
+          warn.hidden = false;
+        }
+      }).catch(function () {
+        btn.disabled = false;
+        btn.textContent = 'Send change request';
+        warn.textContent = 'Could not send. Please try again.';
+        warn.hidden = false;
+      });
+    }
+
+    var file = fileInput.files && fileInput.files[0];
+    if (file) {
+      var reader = new FileReader();
+      reader.onload = function () { send([reader.result]); };
+      reader.onerror = function () { send([]); };
+      reader.readAsDataURL(file);
+    } else {
+      send([]);
+    }
+  }
+
+  // ── Read-only collateral preview  /preview/:itemId ────────────────
+  // The CRM's "Preview" button opens this to show exactly what a client sees,
+  // with Approve / Request-changes disabled. Fetches the read-only preview
+  // endpoint (any status, no side effects) through the same-origin /api proxy.
+  function loadPreview(itemId) {
+    render(el('div', { class: 'cp-loading', text: 'Loading preview…' }));
+    api('GET', '/api/request-forms/public/preview/collateral/' + encodeURIComponent(itemId)).then(function (r) {
+      if (!r.ok || !r.data) {
+        return render(errorState('This preview could not be found.'));
+      }
+      var item = r.data;
+      if (!item.kind) item.kind = 'collateral';
+      var wrap = el('div', {}, [
+        el('div', { class: 'cp-preview-banner', text: "Preview — clients can't act here." }),
+        el('h1', { class: 'cp-h1', text: 'Content Approval Preview' }),
+        el('p', { class: 'cp-sub', text: 'This is exactly how the client sees this item.' }),
+      ]);
+      wrap.appendChild(renderCollateralCard(null, item, { preview: true }));
+      render(wrap);
+    }).catch(function () {
+      render(errorState('Could not load the preview. Please try again.'));
+    });
+  }
+
   // Simple image lightbox (reuses the overlay shell). Pages through `urls`.
   function openImageLightbox(urls, startIndex) {
     var list = (urls || []).filter(Boolean);
@@ -1912,6 +2284,14 @@
         (/^#?\/?video-request/.test(window.location.hash.replace(/^#/, '')) && p === '/')) {
       return { view: 'video-request', token: null };
     }
+    // /preview/:itemId — read-only collateral preview (CRM "Preview" button).
+    // The captured token is the design-collateral id, not a portal token.
+    var pv = p.match(/^\/preview\/([^\/]+)/);
+    if (!pv && window.location.hash) {
+      pv = window.location.hash.replace(/^#/, '').match(/^\/?preview\/([^\/]+)/);
+    }
+    if (pv) return { view: 'preview', token: decodeURIComponent(pv[1]) };
+
     var m = p.match(/^\/(form|approvals|dashboard)\/([^\/]+)/);
     if (!m && window.location.hash) {
       m = window.location.hash.replace(/^#/, '').match(/^\/?(form|approvals|dashboard)\/([^\/]+)/);
@@ -1923,6 +2303,7 @@
   function route() {
     var r = currentRoute();
     if (r.view === 'video-request') return loadVideoRequest();
+    if (r.view === 'preview' && r.token) return loadPreview(r.token);
     if (r.view === 'form' && r.token) return loadForm(r.token);
     if (r.view === 'approvals' && r.token) return loadApprovals(r.token);
     if (r.view === 'dashboard' && r.token) return loadDashboard(r.token);
