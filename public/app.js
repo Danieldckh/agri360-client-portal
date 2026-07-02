@@ -1704,6 +1704,7 @@
     api('POST', '/api/request-forms/public/portal/approve', {
       kind: 'collateral',
       designCollateralId: designCollateralId,
+      portalToken: currentRoute().token || portalToken,
     }).then(function (res) {
       if (res.ok) {
         loadApprovals(currentRoute().token || portalToken);
@@ -1736,6 +1737,7 @@
       api('POST', '/api/request-forms/public/portal/change-request', {
         kind: 'collateral',
         designCollateralId: designCollateralId,
+        portalToken: currentRoute().token || portalToken,
         body: body,
         screenshots: screenshots,
       }).then(function (res) {
