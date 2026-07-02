@@ -1771,13 +1771,19 @@
     }
   }
 
-  // ── Read-only collateral preview  /preview/:itemId ────────────────
+  // ── Read-only collateral preview  /preview/:portalToken/:itemId ───────────
   // The CRM's "Preview" button opens this to show exactly what a client sees,
-  // with Approve / Request-changes disabled. Fetches the read-only preview
-  // endpoint (any status, no side effects) through the same-origin /api proxy.
-  function loadPreview(itemId) {
+  // with Approve / Request-changes disabled. The upstream CRM preview endpoint is
+  // client-scoped (guards against enumerating other clients' collateral by id), so
+  // it requires the client's portal_token — the CRM passes it as the first path
+  // segment. A legacy tokenless link can't be served and gets a clear notice.
+  function loadPreview(portalToken, itemId) {
     render(el('div', { class: 'cp-loading', text: 'Loading preview…' }));
-    api('GET', '/api/request-forms/public/preview/collateral/' + encodeURIComponent(itemId)).then(function (r) {
+    if (!portalToken) {
+      return render(errorState('This preview link is outdated. Please reopen Preview from the CRM.'));
+    }
+    api('GET', '/api/request-forms/public/portal/' + encodeURIComponent(portalToken)
+        + '/preview/collateral/' + encodeURIComponent(itemId)).then(function (r) {
       if (!r.ok || !r.data) {
         return render(errorState('This preview could not be found.'));
       }
@@ -2284,13 +2290,20 @@
         (/^#?\/?video-request/.test(window.location.hash.replace(/^#/, '')) && p === '/')) {
       return { view: 'video-request', token: null };
     }
-    // /preview/:itemId — read-only collateral preview (CRM "Preview" button).
-    // The captured token is the design-collateral id, not a portal token.
-    var pv = p.match(/^\/preview\/([^\/]+)/);
+    // /preview/:portalToken/:itemId — read-only collateral preview (CRM "Preview"
+    // button). Portal-scoped: the CRM now passes the client's portal_token as the
+    // first segment so the upstream CRM call is client-scoped (see loadPreview).
+    // A legacy tokenless /preview/:itemId is still matched but can no longer be
+    // served (the CRM preview endpoint requires the portal token) — loadPreview
+    // renders a clear "reopen from the CRM" notice for it.
+    var pv = p.match(/^\/preview\/([^\/]+)(?:\/([^\/]+))?/);
     if (!pv && window.location.hash) {
-      pv = window.location.hash.replace(/^#/, '').match(/^\/?preview\/([^\/]+)/);
+      pv = window.location.hash.replace(/^#/, '').match(/^\/?preview\/([^\/]+)(?:\/([^\/]+))?/);
     }
-    if (pv) return { view: 'preview', token: decodeURIComponent(pv[1]) };
+    if (pv) {
+      if (pv[2]) return { view: 'preview', token: decodeURIComponent(pv[1]), itemId: decodeURIComponent(pv[2]) };
+      return { view: 'preview', token: null, itemId: decodeURIComponent(pv[1]) };
+    }
 
     var m = p.match(/^\/(form|approvals|dashboard)\/([^\/]+)/);
     if (!m && window.location.hash) {
@@ -2303,7 +2316,7 @@
   function route() {
     var r = currentRoute();
     if (r.view === 'video-request') return loadVideoRequest();
-    if (r.view === 'preview' && r.token) return loadPreview(r.token);
+    if (r.view === 'preview' && r.itemId) return loadPreview(r.token, r.itemId);
     if (r.view === 'form' && r.token) return loadForm(r.token);
     if (r.view === 'approvals' && r.token) return loadApprovals(r.token);
     if (r.view === 'dashboard' && r.token) return loadDashboard(r.token);
