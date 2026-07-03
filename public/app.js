@@ -528,6 +528,7 @@
       deliverableId: deliverable.id,
       postIndex: card.index,
       size: card.post.size || deliverable.size || undefined,
+      portalToken: currentRoute().token || portalToken,
     }).then(function (res) {
       if (res.ok) {
         // Re-fetch so the CRM's auto-advance / approved state is reflected.
@@ -740,6 +741,7 @@
     if (btn) { btn.disabled = true; btn.textContent = 'Approving…'; }
     api('POST', '/api/request-forms/public/portal/approve', {
       deliverableId: d.id,
+      portalToken: currentRoute().token || portalToken,
     }).then(function (res) {
       if (res.ok) {
         loadApprovals(currentRoute().token || portalToken);
@@ -768,6 +770,7 @@
     function send(screenshots) {
       api('POST', '/api/request-forms/public/portal/change-request', {
         deliverableId: d.id,
+        portalToken: currentRoute().token || portalToken,
         body: body,
         screenshots: screenshots,
       }).then(function (res) {
@@ -1088,6 +1091,7 @@
     if (btn) { btn.disabled = true; btn.textContent = 'Approving…'; }
     api('POST', '/api/request-forms/public/portal/approve', {
       deliverableId: d.id,
+      portalToken: currentRoute().token || portalToken,
     }).then(function (res) {
       if (res.ok) {
         loadApprovals(currentRoute().token || portalToken);
@@ -1117,6 +1121,7 @@
     function send(screenshots) {
       api('POST', '/api/request-forms/public/portal/change-request', {
         deliverableId: d.id,
+        portalToken: currentRoute().token || portalToken,
         body: body,
         screenshots: screenshots,
       }).then(function (res) {
@@ -1415,7 +1420,7 @@
   // existing value), then refreshes the approvals list.
   function approveMagazine(portalToken, d, publication, btn) {
     if (btn) { btn.disabled = true; btn.textContent = 'Approving…'; }
-    var body = { deliverableId: d.id };
+    var body = { deliverableId: d.id, portalToken: currentRoute().token || portalToken };
     if (publication) body.publication = publication;
     api('POST', '/api/request-forms/public/portal/approve', body).then(function (res) {
       if (res.ok) {
@@ -1917,6 +1922,7 @@
         body: body,
         screenshots: screenshots,
         captionEdits: captionEdits,
+        portalToken: currentRoute().token || portalToken,
       }).then(function (res) {
         if (res.ok) {
           closeOverlay();
