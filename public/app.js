@@ -127,10 +127,47 @@
 
     var card = el('div', { class: 'cp-card' });
 
-    fields.forEach(function (f) {
-      var field = renderField(f, inputs);
-      if (field) card.appendChild(field);
-    });
+    // Combined per-booking-form questionnaire: fields may be tagged with a
+    // sectionId + sectionLabel (one section per deliverable/department). Group
+    // them under a heading each, preserving field order. If NO field carries a
+    // sectionId (legacy single-deliverable forms), render flat exactly as
+    // before — full backward-compat. Grouping is purely visual: the submit +
+    // validation loops below still walk the flat `fields` array, so every
+    // response maps back by field id regardless of section.
+    var hasSections = fields.some(function (f) { return f.sectionId != null; });
+
+    if (!hasSections) {
+      fields.forEach(function (f) {
+        var field = renderField(f, inputs);
+        if (field) card.appendChild(field);
+      });
+    } else {
+      var order = [];      // section keys in first-seen order
+      var byKey = {};      // key -> { label, fields: [] }
+      var NOSEC = '__nosection__';
+      fields.forEach(function (f) {
+        var key = f.sectionId != null ? f.sectionId : NOSEC;
+        if (!byKey[key]) {
+          byKey[key] = { label: f.sectionLabel || '', fields: [] };
+          order.push(key);
+        }
+        // keep the first non-empty label we see for this section
+        if (!byKey[key].label && f.sectionLabel) byKey[key].label = f.sectionLabel;
+        byKey[key].fields.push(f);
+      });
+      order.forEach(function (key) {
+        var sec = byKey[key];
+        var sectionEl = el('div', { class: 'cp-form-section' });
+        if (key !== NOSEC && sec.label) {
+          sectionEl.appendChild(el('h2', { class: 'cp-section-title', text: sec.label }));
+        }
+        sec.fields.forEach(function (f) {
+          var field = renderField(f, inputs);
+          if (field) sectionEl.appendChild(field);
+        });
+        card.appendChild(sectionEl);
+      });
+    }
 
     var errBox = el('div', { class: 'cp-warn', hidden: true });
     card.appendChild(errBox);
@@ -230,6 +267,12 @@
         placeholder: f.placeholder || '',
         required: !!f.required,
         options: f.options || f.choices || [],
+        // Combined per-booking-form questionnaires tag each field with the
+        // deliverable/department section it belongs to. Preserved (not used
+        // for submit — response mapping stays by field id). Legacy single-
+        // deliverable forms carry neither key -> rendered flat, as before.
+        sectionId: (f.sectionId != null && f.sectionId !== '') ? String(f.sectionId) : null,
+        sectionLabel: f.sectionLabel != null ? String(f.sectionLabel) : '',
       };
     });
   }
@@ -528,6 +571,7 @@
       deliverableId: deliverable.id,
       postIndex: card.index,
       size: card.post.size || deliverable.size || undefined,
+      portalToken: currentRoute().token || portalToken,
     }).then(function (res) {
       if (res.ok) {
         // Re-fetch so the CRM's auto-advance / approved state is reflected.
@@ -740,6 +784,7 @@
     if (btn) { btn.disabled = true; btn.textContent = 'Approving…'; }
     api('POST', '/api/request-forms/public/portal/approve', {
       deliverableId: d.id,
+      portalToken: currentRoute().token || portalToken,
     }).then(function (res) {
       if (res.ok) {
         loadApprovals(currentRoute().token || portalToken);
@@ -768,6 +813,7 @@
     function send(screenshots) {
       api('POST', '/api/request-forms/public/portal/change-request', {
         deliverableId: d.id,
+        portalToken: currentRoute().token || portalToken,
         body: body,
         screenshots: screenshots,
       }).then(function (res) {
@@ -1088,6 +1134,7 @@
     if (btn) { btn.disabled = true; btn.textContent = 'Approving…'; }
     api('POST', '/api/request-forms/public/portal/approve', {
       deliverableId: d.id,
+      portalToken: currentRoute().token || portalToken,
     }).then(function (res) {
       if (res.ok) {
         loadApprovals(currentRoute().token || portalToken);
@@ -1117,6 +1164,7 @@
     function send(screenshots) {
       api('POST', '/api/request-forms/public/portal/change-request', {
         deliverableId: d.id,
+        portalToken: currentRoute().token || portalToken,
         body: body,
         screenshots: screenshots,
       }).then(function (res) {
@@ -1415,7 +1463,7 @@
   // existing value), then refreshes the approvals list.
   function approveMagazine(portalToken, d, publication, btn) {
     if (btn) { btn.disabled = true; btn.textContent = 'Approving…'; }
-    var body = { deliverableId: d.id };
+    var body = { deliverableId: d.id, portalToken: currentRoute().token || portalToken };
     if (publication) body.publication = publication;
     api('POST', '/api/request-forms/public/portal/approve', body).then(function (res) {
       if (res.ok) {
@@ -1704,6 +1752,7 @@
     api('POST', '/api/request-forms/public/portal/approve', {
       kind: 'collateral',
       designCollateralId: designCollateralId,
+      portalToken: currentRoute().token || portalToken,
     }).then(function (res) {
       if (res.ok) {
         loadApprovals(currentRoute().token || portalToken);
@@ -1736,6 +1785,7 @@
       api('POST', '/api/request-forms/public/portal/change-request', {
         kind: 'collateral',
         designCollateralId: designCollateralId,
+        portalToken: currentRoute().token || portalToken,
         body: body,
         screenshots: screenshots,
       }).then(function (res) {
@@ -1771,13 +1821,19 @@
     }
   }
 
-  // ── Read-only collateral preview  /preview/:itemId ────────────────
+  // ── Read-only collateral preview  /preview/:portalToken/:itemId ───────────
   // The CRM's "Preview" button opens this to show exactly what a client sees,
-  // with Approve / Request-changes disabled. Fetches the read-only preview
-  // endpoint (any status, no side effects) through the same-origin /api proxy.
-  function loadPreview(itemId) {
+  // with Approve / Request-changes disabled. The upstream CRM preview endpoint is
+  // client-scoped (guards against enumerating other clients' collateral by id), so
+  // it requires the client's portal_token — the CRM passes it as the first path
+  // segment. A legacy tokenless link can't be served and gets a clear notice.
+  function loadPreview(portalToken, itemId) {
     render(el('div', { class: 'cp-loading', text: 'Loading preview…' }));
-    api('GET', '/api/request-forms/public/preview/collateral/' + encodeURIComponent(itemId)).then(function (r) {
+    if (!portalToken) {
+      return render(errorState('This preview link is outdated. Please reopen Preview from the CRM.'));
+    }
+    api('GET', '/api/request-forms/public/portal/' + encodeURIComponent(portalToken)
+        + '/preview/collateral/' + encodeURIComponent(itemId)).then(function (r) {
       if (!r.ok || !r.data) {
         return render(errorState('This preview could not be found.'));
       }
@@ -1909,6 +1965,7 @@
         body: body,
         screenshots: screenshots,
         captionEdits: captionEdits,
+        portalToken: currentRoute().token || portalToken,
       }).then(function (res) {
         if (res.ok) {
           closeOverlay();
@@ -2284,13 +2341,20 @@
         (/^#?\/?video-request/.test(window.location.hash.replace(/^#/, '')) && p === '/')) {
       return { view: 'video-request', token: null };
     }
-    // /preview/:itemId — read-only collateral preview (CRM "Preview" button).
-    // The captured token is the design-collateral id, not a portal token.
-    var pv = p.match(/^\/preview\/([^\/]+)/);
+    // /preview/:portalToken/:itemId — read-only collateral preview (CRM "Preview"
+    // button). Portal-scoped: the CRM now passes the client's portal_token as the
+    // first segment so the upstream CRM call is client-scoped (see loadPreview).
+    // A legacy tokenless /preview/:itemId is still matched but can no longer be
+    // served (the CRM preview endpoint requires the portal token) — loadPreview
+    // renders a clear "reopen from the CRM" notice for it.
+    var pv = p.match(/^\/preview\/([^\/]+)(?:\/([^\/]+))?/);
     if (!pv && window.location.hash) {
-      pv = window.location.hash.replace(/^#/, '').match(/^\/?preview\/([^\/]+)/);
+      pv = window.location.hash.replace(/^#/, '').match(/^\/?preview\/([^\/]+)(?:\/([^\/]+))?/);
     }
-    if (pv) return { view: 'preview', token: decodeURIComponent(pv[1]) };
+    if (pv) {
+      if (pv[2]) return { view: 'preview', token: decodeURIComponent(pv[1]), itemId: decodeURIComponent(pv[2]) };
+      return { view: 'preview', token: null, itemId: decodeURIComponent(pv[1]) };
+    }
 
     var m = p.match(/^\/(form|approvals|dashboard)\/([^\/]+)/);
     if (!m && window.location.hash) {
@@ -2303,7 +2367,7 @@
   function route() {
     var r = currentRoute();
     if (r.view === 'video-request') return loadVideoRequest();
-    if (r.view === 'preview' && r.token) return loadPreview(r.token);
+    if (r.view === 'preview' && r.itemId) return loadPreview(r.token, r.itemId);
     if (r.view === 'form' && r.token) return loadForm(r.token);
     if (r.view === 'approvals' && r.token) return loadApprovals(r.token);
     if (r.view === 'dashboard' && r.token) return loadDashboard(r.token);

@@ -122,6 +122,23 @@ body {
 .cp-badge-action { background: var(--cp-primary-soft); color: var(--cp-primary); }
 .cp-badge-approved { background: var(--cp-success-soft); color: var(--cp-success); }
 
+/* ── Combined-questionnaire sections (one per deliverable/department) ── */
+.cp-form-section { margin-bottom: 8px; }
+.cp-form-section + .cp-form-section {
+  margin-top: 26px;
+  padding-top: 22px;
+  border-top: 1px solid var(--cp-border);
+}
+.cp-section-title {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--cp-primary);
+  margin: 0 0 16px;
+  padding-bottom: 8px;
+  border-bottom: 2px solid var(--cp-primary-soft);
+}
+
 /* ── Form fields (focus-points) ── */
 .cp-field { margin-bottom: 18px; }
 .cp-field-label {
