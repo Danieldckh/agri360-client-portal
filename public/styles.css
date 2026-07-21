@@ -707,3 +707,8 @@ body {
   font-weight: 600; cursor: pointer;
 }
 .cp-vrf-popup-actions button:hover { background: var(--cp-surface-2); }
+
+/* Combined per-booking-form questionnaire: one section per deliverable/department */
+.cp-form-section { margin-bottom: 18px; }
+.cp-form-section + .cp-form-section { border-top: 1px solid var(--cp-surface-2, rgba(0,0,0,0.08)); padding-top: 16px; }
+.cp-section-title { font-size: 15px; font-weight: 700; color: var(--cp-primary); margin: 0 0 12px; }

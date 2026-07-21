@@ -127,10 +127,38 @@
 
     var card = el('div', { class: 'cp-card' });
 
-    fields.forEach(function (f) {
-      var field = renderField(f, inputs);
-      if (field) card.appendChild(field);
-    });
+    // When fields carry a sectionId (one combined per-booking-form
+    // questionnaire = one section per deliverable/department), render them
+    // grouped under a heading per section, in first-seen section order.
+    // Legacy flat forms (no sectionId) render exactly as before.
+    var hasSections = fields.some(function (f) { return f.sectionId != null; });
+    if (!hasSections) {
+      fields.forEach(function (f) {
+        var field = renderField(f, inputs);
+        if (field) card.appendChild(field);
+      });
+    } else {
+      var order = [];
+      var buckets = {};
+      var labels = {};
+      fields.forEach(function (f) {
+        var key = f.sectionId == null ? '__nosection__' : f.sectionId;
+        if (!buckets[key]) { buckets[key] = []; order.push(key); }
+        buckets[key].push(f);
+        if (!labels[key] && f.sectionLabel) labels[key] = f.sectionLabel;
+      });
+      order.forEach(function (key) {
+        var sec = el('div', { class: 'cp-form-section' });
+        if (key !== '__nosection__' && labels[key]) {
+          sec.appendChild(el('h2', { class: 'cp-section-title', text: labels[key] }));
+        }
+        buckets[key].forEach(function (f) {
+          var field = renderField(f, inputs);
+          if (field) sec.appendChild(field);
+        });
+        card.appendChild(sec);
+      });
+    }
 
     var errBox = el('div', { class: 'cp-warn', hidden: true });
     card.appendChild(errBox);
@@ -230,6 +258,8 @@
         placeholder: f.placeholder || '',
         required: !!f.required,
         options: f.options || f.choices || [],
+        sectionId: (f.sectionId != null && f.sectionId !== '') ? String(f.sectionId) : null,
+        sectionLabel: f.sectionLabel || '',
       };
     });
   }
