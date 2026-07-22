@@ -98,6 +98,211 @@
   })();
 
   // ════════════════════════════════════════════════════════════════
+  // LIVE SYNC — presence, typing, auto-refresh (polling, ~3s)
+  // ════════════════════════════════════════════════════════════════
+  // A single POST every ~3s per open viewer does three jobs: heartbeat
+  // (presence), typing broadcast, and a cheap dataVersion check. When the
+  // version changes, the current view silently re-fetches so two people on the
+  // same portal link see each other's approvals/change-requests live — like a
+  // shared Google Sheet. Nothing WebSocket/SSE: plain short polling through the
+  // existing same-origin /api proxy.
+  var SYNC_INTERVAL_MS = 3000;
+  var presenceEl = document.getElementById('cp-presence');
+
+  // Persistent anonymous identity ("Anonymous Otter"), Google-Sheets style.
+  var CP_ANIMALS = ['Otter', 'Ibex', 'Heron', 'Lynx', 'Falcon', 'Marten', 'Bison', 'Crane', 'Fennec', 'Kudu', 'Oryx', 'Quokka', 'Serval', 'Tapir'];
+  var CP_COLORS = ['#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6', '#EC4899', '#14B8A6', '#F97316'];
+  function cpIdentity() {
+    var saved = null;
+    try { saved = JSON.parse(localStorage.getItem('cpSession') || 'null'); } catch (e) { saved = null; }
+    if (saved && saved.label && saved.color) return saved;
+    var a = CP_ANIMALS[Math.floor(Math.random() * CP_ANIMALS.length)];
+    var c = CP_COLORS[Math.floor(Math.random() * CP_COLORS.length)];
+    var id = { label: 'Anonymous ' + a, color: c };
+    try { localStorage.setItem('cpSession', JSON.stringify(id)); } catch (e) { /* private mode */ }
+    return id;
+  }
+  var CP_IDENTITY = cpIdentity();
+  var CP_SESSION_ID = (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : ('s-' + Date.now() + '-' + Math.random().toString(36).slice(2));
+
+  var syncState = {
+    token: null, page: null, itemId: null, loader: null,
+    timer: null, lastVersion: null, pendingRefresh: false,
+    typingItemId: null, typingTimer: null, lastTyping: [], restoreAfterRender: null,
+  };
+
+  // Attach a deliverable id to a card node so remote typing indicators can find
+  // the right card. Returns the node for inline use.
+  function tagItem(node, d) {
+    if (node && node.setAttribute && d && d.id != null) node.setAttribute('data-cp-item', String(d.id));
+    return node;
+  }
+
+  function stopSync() {
+    if (syncState.timer) { clearInterval(syncState.timer); syncState.timer = null; }
+    if (syncState.typingTimer) { clearTimeout(syncState.typingTimer); syncState.typingTimer = null; }
+    syncState.token = null; syncState.page = null; syncState.itemId = null; syncState.loader = null;
+    syncState.lastVersion = null; syncState.pendingRefresh = false;
+    syncState.typingItemId = null; syncState.lastTyping = []; syncState.restoreAfterRender = null;
+    if (presenceEl) { presenceEl.hidden = true; clear(presenceEl); }
+  }
+
+  // page: 'approvals'|'dashboard'|'preview'|'form'. loader(token, silent) re-runs
+  // the current view on a data change (null for the form — presence/typing only).
+  function startSync(page, token, itemId, loader) {
+    stopSync();
+    if (!token) return;
+    syncState.token = token;
+    syncState.page = page;
+    syncState.itemId = itemId != null ? String(itemId) : null;
+    syncState.loader = loader || null;
+    syncTick();
+    syncState.timer = setInterval(syncTick, SYNC_INTERVAL_MS);
+  }
+
+  function syncTick() {
+    if (!syncState.token) return;
+    if (document.visibilityState === 'hidden') return; // pause; server TTL drops us
+    var payload = {
+      sessionId: CP_SESSION_ID,
+      label: CP_IDENTITY.label,
+      color: CP_IDENTITY.color,
+      page: syncState.page,
+      itemId: syncState.typingItemId || syncState.itemId || '',
+      typing: !!syncState.typingItemId,
+    };
+    api('POST', '/api/request-forms/public/portal/' + encodeURIComponent(syncState.token) + '/sync', payload)
+      .then(function (r) {
+        if (!r || !r.ok || !r.data) return;
+        updatePresenceUI(r.data.viewers || []);
+        syncState.lastTyping = r.data.typing || [];
+        updateTypingUI(syncState.lastTyping);
+        // Flush a refresh that was deferred while the user was interacting.
+        if (syncState.pendingRefresh && !isRefreshBlocked()) { doRefresh(); return; }
+        var v = r.data.dataVersion;
+        if (v == null) return;
+        if (syncState.lastVersion == null) { syncState.lastVersion = v; return; }
+        if (v !== syncState.lastVersion) {
+          syncState.lastVersion = v;
+          maybeRefresh();
+        }
+      })
+      .catch(function () { /* transient — next tick retries */ });
+  }
+
+  // Resume immediately when the tab regains focus.
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible' && syncState.token) syncTick();
+  });
+
+  // Would a background re-render disrupt the user? Yes if they are focused in a
+  // dirty field (never wipe typed text) OR a change-request box is open (don't
+  // collapse it mid-thought). Covers the overlay too via activeElement.
+  function isRefreshBlocked() {
+    var a = document.activeElement;
+    if (a && a.matches && a.matches('textarea, input') && String(a.value || '').trim() !== '') return true;
+    var boxes = appEl.querySelectorAll('.cp-textarea');
+    for (var i = 0; i < boxes.length; i++) {
+      if (boxes[i].offsetParent !== null) return true; // visible = open box
+    }
+    return false;
+  }
+
+  function maybeRefresh() {
+    if (!syncState.loader || !syncState.token) return;
+    if (isRefreshBlocked()) { syncState.pendingRefresh = true; return; }
+    doRefresh();
+  }
+
+  function doRefresh() {
+    syncState.pendingRefresh = false;
+    if (!syncState.loader) return;
+    var y = window.scrollY;
+    syncState.restoreAfterRender = function () {
+      try { window.scrollTo(0, y); } catch (e) { /* no-op */ }
+      updateTypingUI(syncState.lastTyping);
+    };
+    try { syncState.loader(syncState.token, true); }
+    catch (e) { syncState.restoreAfterRender = null; }
+  }
+
+  // Called at the tail of each view's render to restore scroll + typing lines
+  // after a silent background refresh.
+  function afterRenderRestore() {
+    if (syncState.restoreAfterRender) {
+      var f = syncState.restoreAfterRender;
+      syncState.restoreAfterRender = null;
+      try { f(); } catch (e) { /* no-op */ }
+    }
+  }
+
+  function updatePresenceUI(viewers) {
+    if (!presenceEl) return;
+    viewers = Array.isArray(viewers) ? viewers : [];
+    if (viewers.length <= 1) { presenceEl.hidden = true; clear(presenceEl); return; }
+    // Dedupe avatars by label (a person may have multiple tabs); count sessions.
+    var seen = {}, uniq = [];
+    viewers.forEach(function (v) {
+      if (!v || !v.label || seen[v.label]) return;
+      seen[v.label] = true; uniq.push(v);
+    });
+    clear(presenceEl);
+    presenceEl.hidden = false;
+    var avatars = el('div', { class: 'cp-presence-avatars' });
+    uniq.slice(0, 5).forEach(function (v) {
+      var initial = (String(v.label).replace('Anonymous ', '').charAt(0) || '?').toUpperCase();
+      avatars.appendChild(el('span', { class: 'cp-avatar', title: v.label, style: 'background:' + v.color }, [initial]));
+    });
+    if (uniq.length > 5) avatars.appendChild(el('span', { class: 'cp-avatar cp-avatar-more', text: '+' + (uniq.length - 5) }));
+    presenceEl.appendChild(avatars);
+    presenceEl.appendChild(el('span', { class: 'cp-presence-count', text: viewers.length + ' viewing' }));
+  }
+
+  function updateTypingUI(typing) {
+    // Wipe existing lines, then re-add for currently-typing remote viewers.
+    var existing = appEl.querySelectorAll('.cp-typing-line');
+    for (var i = 0; i < existing.length; i++) {
+      if (existing[i].parentNode) existing[i].parentNode.removeChild(existing[i]);
+    }
+    if (!Array.isArray(typing) || !typing.length) return;
+    var byItem = {};
+    typing.forEach(function (t) {
+      if (!t || t.sessionId === CP_SESSION_ID || !t.itemId) return;
+      (byItem[t.itemId] = byItem[t.itemId] || []).push(t.label || 'Someone');
+    });
+    Object.keys(byItem).forEach(function (itemId) {
+      if (!/^[\w:.-]+$/.test(itemId)) return; // selector-safe ids only
+      var card = appEl.querySelector('[data-cp-item="' + itemId + '"]');
+      if (!card) return;
+      var labels = byItem[itemId];
+      var who = labels.length === 1 ? labels[0] : (labels.length + ' people');
+      card.appendChild(el('div', { class: 'cp-typing-line', text: who + ' is typing a change request…' }));
+    });
+  }
+
+  // Local typing broadcast: any input in a change-request textarea flags this
+  // session as typing on the enclosing card's item for the next few seconds.
+  appEl.addEventListener('input', function (e) {
+    var t = e.target;
+    if (!t || !t.matches || !t.matches('.cp-textarea')) return;
+    var card = t.closest ? t.closest('[data-cp-item]') : null;
+    syncState.typingItemId = (card && card.getAttribute('data-cp-item')) || syncState.itemId || 'x';
+    if (syncState.typingTimer) clearTimeout(syncState.typingTimer);
+    syncState.typingTimer = setTimeout(function () { syncState.typingItemId = null; }, 3500);
+  });
+  appEl.addEventListener('focusout', function (e) {
+    var t = e.target;
+    if (t && t.matches && t.matches('.cp-textarea')) {
+      syncState.typingItemId = null;
+      if (syncState.typingTimer) { clearTimeout(syncState.typingTimer); syncState.typingTimer = null; }
+    }
+    // Flush a deferred refresh once the box is closed / field left.
+    setTimeout(function () { if (syncState.pendingRefresh && !isRefreshBlocked()) maybeRefresh(); }, 50);
+  });
+
+  // ════════════════════════════════════════════════════════════════
   // FLOW 1 — FOCUS-POINTS FORM   /form/:token
   // ════════════════════════════════════════════════════════════════
   function loadForm(token) {
@@ -107,6 +312,9 @@
         return render(errorState('This form could not be found or has expired.'));
       }
       renderForm(token, r.data);
+      // Presence/typing only — a form token isn't a portal_token, so the server
+      // returns dataVersion:null and no auto-refresh runs.
+      startSync('form', token, null, null);
     }).catch(function () {
       render(errorState('Could not load the form. Please try again.'));
     });
@@ -337,16 +545,18 @@
   // portalToken is an opaque, unguessable string (clients.portal_token).
   // It is forwarded verbatim to the CRM, which resolves it to a client —
   // no parseInt, no ?clientId.
-  function loadApprovals(portalToken) {
-    render(el('div', { class: 'cp-loading', text: 'Loading approvals…' }));
+  function loadApprovals(portalToken, silent) {
+    if (!silent) render(el('div', { class: 'cp-loading', text: 'Loading approvals…' }));
     api('GET', '/api/request-forms/public/portal/' + encodeURIComponent(portalToken) + '/approvals').then(function (r) {
       if (!r.ok) {
-        return render(errorState('Could not load your approvals. The link may be invalid.'));
+        if (!silent) render(errorState('Could not load your approvals. The link may be invalid.'));
+        return;
       }
       var items = extractDeliverables(r.data);
       renderApprovalList(portalToken, items);
+      startSync('approvals', portalToken, null, loadApprovals);
     }).catch(function () {
-      render(errorState('Could not load your approvals. Please try again.'));
+      if (!silent) render(errorState('Could not load your approvals. Please try again.'));
     });
   }
 
@@ -429,7 +639,8 @@
         el('div', { class: 'cp-tick', text: '✓' }),
         el('p', { text: 'Nothing needs your approval right now.' }),
       ]));
-      return render(wrap);
+      render(wrap);
+      return afterRenderRestore();
     }
 
     items.forEach(function (d) {
@@ -437,21 +648,21 @@
       // (item.approvalLayout). Branch on kind BEFORE the type checks so the
       // configurable card renderer takes precedence over any type heuristics.
       if (d.kind === 'collateral') {
-        wrap.appendChild(renderCollateralCard(portalToken, d));
+        wrap.appendChild(tagItem(renderCollateralCard(portalToken, d), d));
         return;
       }
 
       // Website-design deliverables get a dedicated approval card; the CC
       // per-post path below is left fully intact.
       if (isWebsiteDesign(d)) {
-        wrap.appendChild(renderWebsiteDesignCard(portalToken, d));
+        wrap.appendChild(tagItem(renderWebsiteDesignCard(portalToken, d), d));
         return;
       }
 
       // Video deliverables get a dedicated approval card: an embedded HTML5
       // player for the cut + whole-deliverable Approve / Request-changes.
       if (isVideo(d)) {
-        wrap.appendChild(renderVideoCard(portalToken, d));
+        wrap.appendChild(tagItem(renderVideoCard(portalToken, d), d));
         return;
       }
 
@@ -462,9 +673,9 @@
       //   • 'agri4all-links'    → LIVE-LINKS approval (shows live listings)
       if (isAgri4allProductUploads(d)) {
         if (d.status === 'agri4all-links') {
-          wrap.appendChild(renderAgri4allLinksCard(portalToken, d));
+          wrap.appendChild(tagItem(renderAgri4allLinksCard(portalToken, d), d));
         } else {
-          wrap.appendChild(renderAgri4allProductCard(portalToken, d));
+          wrap.appendChild(tagItem(renderAgri4allProductCard(portalToken, d), d));
         }
         return;
       }
@@ -473,7 +684,7 @@
       // with a publication pill (static when resolved, selectable when the
       // 'Print Ad / Print Article' choice is still undecided).
       if (isMagazine(d)) {
-        wrap.appendChild(renderMagazineCard(portalToken, d));
+        wrap.appendChild(tagItem(renderMagazineCard(portalToken, d), d));
         return;
       }
 
@@ -499,10 +710,11 @@
         card.appendChild(renderGallery(portalToken, d, cards));
       }
 
-      wrap.appendChild(card);
+      wrap.appendChild(tagItem(card, d));
     });
 
     render(wrap);
+    afterRenderRestore();
   }
 
   function renderGallery(portalToken, deliverable, cards) {
@@ -1814,15 +2026,17 @@
   // client-scoped (guards against enumerating other clients' collateral by id), so
   // it requires the client's portal_token — the CRM passes it as the first path
   // segment. A legacy tokenless link can't be served and gets a clear notice.
-  function loadPreview(portalToken, itemId) {
-    render(el('div', { class: 'cp-loading', text: 'Loading preview…' }));
+  function loadPreview(portalToken, itemId, silent) {
+    if (!silent) render(el('div', { class: 'cp-loading', text: 'Loading preview…' }));
     if (!portalToken) {
-      return render(errorState('This preview link is outdated. Please reopen Preview from the CRM.'));
+      if (!silent) render(errorState('This preview link is outdated. Please reopen Preview from the CRM.'));
+      return;
     }
     api('GET', '/api/request-forms/public/portal/' + encodeURIComponent(portalToken)
         + '/preview/collateral/' + encodeURIComponent(itemId)).then(function (r) {
       if (!r.ok || !r.data) {
-        return render(errorState('This preview could not be found.'));
+        if (!silent) render(errorState('This preview could not be found.'));
+        return;
       }
       var item = r.data;
       if (!item.kind) item.kind = 'collateral';
@@ -1831,10 +2045,12 @@
         el('h1', { class: 'cp-h1', text: 'Content Approval Preview' }),
         el('p', { class: 'cp-sub', text: 'This is exactly how the client sees this item.' }),
       ]);
-      wrap.appendChild(renderCollateralCard(null, item, { preview: true }));
+      wrap.appendChild(tagItem(renderCollateralCard(null, item, { preview: true }), item));
       render(wrap);
+      startSync('preview', portalToken, itemId, function (t, s) { loadPreview(t, itemId, s); });
+      afterRenderRestore();
     }).catch(function () {
-      render(errorState('Could not load the preview. Please try again.'));
+      if (!silent) render(errorState('Could not load the preview. Please try again.'));
     });
   }
 
@@ -2255,15 +2471,17 @@
   // ════════════════════════════════════════════════════════════════
   // FLOW 4 — CLIENT DASHBOARD   /dashboard/:portalToken
   // ════════════════════════════════════════════════════════════════
-  function loadDashboard(portalToken) {
-    render(el('div', { class: 'cp-loading', text: 'Loading your dashboard…' }));
+  function loadDashboard(portalToken, silent) {
+    if (!silent) render(el('div', { class: 'cp-loading', text: 'Loading your dashboard…' }));
     api('GET', '/api/request-forms/public/portal/' + encodeURIComponent(portalToken) + '/dashboard').then(function (r) {
       if (!r.ok || !r.data) {
-        return render(errorState('Could not load your dashboard. The link may be invalid.'));
+        if (!silent) render(errorState('Could not load your dashboard. The link may be invalid.'));
+        return;
       }
       renderDashboard(portalToken, r.data);
+      startSync('dashboard', portalToken, null, loadDashboard);
     }).catch(function () {
-      render(errorState('Could not load your dashboard. Please try again.'));
+      if (!silent) render(errorState('Could not load your dashboard. Please try again.'));
     });
   }
 
@@ -2317,6 +2535,7 @@
       wrap.appendChild(list);
     }
     render(wrap);
+    afterRenderRestore();
   }
 
   // ── Router (path-based, with hash fallback) ──────────────────────
@@ -2352,6 +2571,7 @@
   }
 
   function route() {
+    stopSync(); // tear down any prior view's live-sync before dispatching
     var r = currentRoute();
     if (r.view === 'video-request') return loadVideoRequest();
     if (r.view === 'preview' && r.itemId) return loadPreview(r.token, r.itemId);
