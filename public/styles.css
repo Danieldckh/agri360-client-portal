@@ -972,12 +972,17 @@ body {
   flex: 0 0 100%;
   max-width: 100%;
   scroll-snap-align: start;
+  background: var(--cp-surface-2);
 }
+/* Never crop the artwork — clients approve what they actually see. The image
+   renders at its natural aspect until max-height clamps it, and object-fit
+   contain letterboxes rather than slicing off the bottom of a tall design. */
 .cp-ccs-img {
   display: block;
   width: 100%;
-  aspect-ratio: 1 / 1;
-  object-fit: cover;
+  height: auto;
+  max-height: 640px;
+  object-fit: contain;
   cursor: zoom-in;
   background: var(--cp-surface-2);
 }
