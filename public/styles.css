@@ -800,10 +800,19 @@ body {
   .cp-cc-editor { max-height: 320px; overflow-y: auto; }
 }
 .cp-cc-captionwrap .cp-toolbar { margin-bottom: 4px; }
-.cp-cc-mediacell { display: flex; flex-direction: column; gap: 8px; }
+/* Multiple images under one post scroll as a horizontal snap carousel. */
+.cp-cc-mediacell {
+  display: flex; flex-direction: row; gap: 8px;
+  overflow-x: auto; scroll-snap-type: x proximity;
+  max-width: 236px; padding-bottom: 4px;
+}
+.cp-cc-mediacell::-webkit-scrollbar { height: 6px; }
+.cp-cc-mediacell::-webkit-scrollbar-thumb { background: var(--cp-border-strong); border-radius: 999px; }
+.cp-cc-mediacell::-webkit-scrollbar-track { background: transparent; }
 .cp-cc-mediaitem {
   display: flex; flex-direction: column; gap: 4px; align-items: flex-start;
   border: 2px solid transparent; border-radius: 8px; padding: 3px;
+  flex: 0 0 auto; scroll-snap-align: start;
 }
 .cp-cc-mediaitem.cp-cc-marked { border-color: var(--cp-primary); background: var(--cp-primary-soft); }
 .cp-cc-thumb {
@@ -855,6 +864,9 @@ body {
   }
   .cp-cc-td-caption { min-width: 0; }
   .cp-cc-note { width: 100%; }
+  /* Carousel spans the card width; bigger thumbs for thumb-driven review. */
+  .cp-cc-mediacell { max-width: 100%; }
+  .cp-cc-thumb { width: 132px; height: 132px; }
   /* Blank media slots are noise in the stacked layout. (Needs the extra
      .cp-cc-table td qualifier to outrank the display:block collapse rule.) */
   .cp-cc-table td.cp-cc-td-blank { display: none; }
