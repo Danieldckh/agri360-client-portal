@@ -764,6 +764,12 @@ body {
   .cp-presence-count { display: none; } /* keep just the avatars on small screens */
 }
 
+/* Approvals view goes full-width — the CC posts table needs the room. */
+.cp-main.cp-wide { max-width: none; padding-left: 32px; padding-right: 32px; }
+@media (max-width: 560px) {
+  .cp-main.cp-wide { padding-left: 16px; padding-right: 16px; }
+}
+
 /* ── Content-calendar approval card ── */
 .cp-cc-card { overflow: hidden; }
 .cp-cc-tablewrap { overflow-x: auto; margin-top: 14px; }

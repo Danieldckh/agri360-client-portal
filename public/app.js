@@ -44,7 +44,9 @@
   }
 
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
-  function render(node) { clear(appEl); appEl.appendChild(node); }
+  // Views are narrow (880px) by default; the approvals view re-adds cp-wide
+  // after each render for a full-width layout (the CC posts table needs it).
+  function render(node) { appEl.classList.remove('cp-wide'); clear(appEl); appEl.appendChild(node); }
 
   function escapeHtml(s) {
     return String(s == null ? '' : s)
@@ -746,6 +748,7 @@
     });
 
     render(wrap);
+    appEl.classList.add('cp-wide');
     afterRenderRestore();
   }
 
