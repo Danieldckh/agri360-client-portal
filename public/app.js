@@ -3,9 +3,11 @@
 /*
  * Agri360 Client Portal — SPA
  * ----------------------------
- * Client-facing, no login. Two flows only:
- *   1) /form/:token            — fill + submit a focus-points questionnaire.
- *   2) /approvals/:portalToken — approve / request changes on CC deliverables.
+ * Client-facing, no login. Token-linked flows:
+ *   1) /form/:token              — fill + submit a focus-points questionnaire.
+ *   2) /approvals/:portalToken   — approve / request changes on CC deliverables.
+ *   3) /dashboard/:portalToken   — content overview + previous approvals.
+ *   4) /video-forms/:portalToken — the client's video request forms, by month.
  *
  * The :portalToken is an opaque, unguessable string (clients.portal_token).
  * It is passed straight through to the CRM, which resolves it to a client —
@@ -203,6 +205,10 @@
   function isRefreshBlocked() {
     var a = document.activeElement;
     if (a && a.matches && a.matches('textarea, input') && String(a.value || '').trim() !== '') return true;
+    if (a && a.isContentEditable) return true; // mid caption / focus-points edit
+    // Unsubmitted CC card state (marks, notes, caption edits) lives only in
+    // the DOM — a background re-render would wipe it.
+    if (appEl.querySelector('[data-cc-dirty="1"]')) return true;
     var boxes = appEl.querySelectorAll('.cp-textarea');
     for (var i = 0; i < boxes.length; i++) {
       if (boxes[i].offsetParent !== null) return true; // visible = open box
@@ -335,36 +341,45 @@
 
     var card = el('div', { class: 'cp-card' });
 
-    // When fields carry a sectionId (one combined per-booking-form
-    // questionnaire = one section per deliverable/department), render them
-    // grouped under a heading per section, in first-seen section order.
-    // Legacy flat forms (no sectionId) render exactly as before.
+    // Combined per-booking-form questionnaire: fields may be tagged with a
+    // sectionId + sectionLabel (one section per deliverable/department). Group
+    // them under a heading each, preserving field order. If NO field carries a
+    // sectionId (legacy single-deliverable forms), render flat exactly as
+    // before — full backward-compat. Grouping is purely visual: the submit +
+    // validation loops below still walk the flat `fields` array, so every
+    // response maps back by field id regardless of section.
     var hasSections = fields.some(function (f) { return f.sectionId != null; });
+
     if (!hasSections) {
       fields.forEach(function (f) {
         var field = renderField(f, inputs);
         if (field) card.appendChild(field);
       });
     } else {
-      var order = [];
-      var buckets = {};
-      var labels = {};
+      var order = [];      // section keys in first-seen order
+      var byKey = {};      // key -> { label, fields: [] }
+      var NOSEC = '__nosection__';
       fields.forEach(function (f) {
-        var key = f.sectionId == null ? '__nosection__' : f.sectionId;
-        if (!buckets[key]) { buckets[key] = []; order.push(key); }
-        buckets[key].push(f);
-        if (!labels[key] && f.sectionLabel) labels[key] = f.sectionLabel;
+        var key = f.sectionId != null ? f.sectionId : NOSEC;
+        if (!byKey[key]) {
+          byKey[key] = { label: f.sectionLabel || '', fields: [] };
+          order.push(key);
+        }
+        // keep the first non-empty label we see for this section
+        if (!byKey[key].label && f.sectionLabel) byKey[key].label = f.sectionLabel;
+        byKey[key].fields.push(f);
       });
       order.forEach(function (key) {
-        var sec = el('div', { class: 'cp-form-section' });
-        if (key !== '__nosection__' && labels[key]) {
-          sec.appendChild(el('h2', { class: 'cp-section-title', text: labels[key] }));
+        var sec = byKey[key];
+        var sectionEl = el('div', { class: 'cp-form-section' });
+        if (key !== NOSEC && sec.label) {
+          sectionEl.appendChild(el('h2', { class: 'cp-section-title', text: sec.label }));
         }
-        buckets[key].forEach(function (f) {
+        sec.fields.forEach(function (f) {
           var field = renderField(f, inputs);
-          if (field) sec.appendChild(field);
+          if (field) sectionEl.appendChild(field);
         });
-        card.appendChild(sec);
+        card.appendChild(sectionEl);
       });
     }
 
@@ -466,8 +481,12 @@
         placeholder: f.placeholder || '',
         required: !!f.required,
         options: f.options || f.choices || [],
+        // Combined per-booking-form questionnaires tag each field with the
+        // deliverable/department section it belongs to. Preserved (not used
+        // for submit — response mapping stays by field id). Legacy single-
+        // deliverable forms carry neither key -> rendered flat, as before.
         sectionId: (f.sectionId != null && f.sectionId !== '') ? String(f.sectionId) : null,
-        sectionLabel: f.sectionLabel || '',
+        sectionLabel: f.sectionLabel != null ? String(f.sectionLabel) : '',
       };
     });
   }
@@ -688,6 +707,19 @@
         return;
       }
 
+      // Content calendars get dedicated cards wired to the CRM's real post
+      // shape (metadata.posts[].media buckets + captionHtml): a posts table
+      // once artwork is up for review, and a focus-points table at the earlier
+      // materials stage. The generic per-post path below reads a retired post
+      // shape and stays only as a fallback for unknown types.
+      if (d.type === 'sm-content-calendar') {
+        var isFocusPoints = d.status === 'materials_requested' || d.status === 'focus_points_sent';
+        wrap.appendChild(tagItem(isFocusPoints
+          ? renderCcFocusPointsCard(portalToken, d)
+          : renderContentCalendarCard(portalToken, d), d));
+        return;
+      }
+
       var cards = mediaPosts(d);
       var allApproved = cards.length > 0 && cards.every(function (c) { return isApprovedStatus(c.post.status); });
 
@@ -785,6 +817,550 @@
       if (btn) { btn.disabled = false; btn.textContent = 'Approve'; }
       alert('Could not approve. Please try again.');
     });
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // CONTENT-CALENDAR APPROVAL CARD  (type === 'sm-content-calendar')
+  // ════════════════════════════════════════════════════════════════
+  // Mirrors the CRM dashboard's Posts card as a client-facing table:
+  //   # | Post date | Caption | one media column per artwork slot | Actions
+  // Contract (CRM metadata.posts[]): { postUid, postDate, captionHtml,
+  //   media: { <slotKey>: [{kind,url,name,mimeType,size}] },
+  //   approvals: { <slotKey>: true } }.
+  // Slot vocabulary is api/lib/cc-slots.js — the legacy three buckets unless
+  // metadata.channelPlan.sizeSlots snapshots something richer. Ported minimally
+  // below (aliases folded, labels display-only).
+  var CC_LEGACY_BUCKETS = ['facebook', 'instagram', 'stories'];
+  var CC_SLOT_ALIASES = {
+    facebook: 'facebook', landscape: 'facebook',
+    instagram: 'instagram', square: 'instagram',
+    stories: 'stories', story: 'stories', vertical: 'stories',
+    tiktok: 'stories', reels: 'stories',
+  };
+  var CC_SLOT_LABELS = { facebook: 'Landscape', instagram: 'Square', stories: 'Vertical (Story)' };
+  var CC_MAX_ROUNDS = 3;
+
+  function ccCanonicalSlot(v) {
+    if (v == null) return '';
+    var t = String(v).trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!t) return '';
+    return CC_SLOT_ALIASES[t] || t;
+  }
+
+  function ccSlotsOf(meta) {
+    var cp = meta && meta.channelPlan;
+    var raw = (cp && Array.isArray(cp.sizeSlots)) ? cp.sizeSlots : [];
+    var out = [];
+    var seen = {};
+    raw.forEach(function (r) {
+      if (!r) return;
+      var isObj = typeof r === 'object';
+      var key = ccCanonicalSlot(isObj ? (r.slotKey || r.sizeKey || r.key) : r);
+      if (!key || seen[key]) return;
+      seen[key] = true;
+      out.push({
+        slotKey: key,
+        label: (isObj && typeof r.label === 'string' && r.label.trim()) ? r.label.trim() : (CC_SLOT_LABELS[key] || key),
+      });
+    });
+    if (!out.length) {
+      return CC_LEGACY_BUCKETS.map(function (k) { return { slotKey: k, label: CC_SLOT_LABELS[k] }; });
+    }
+    out.sort(function (a, b) {
+      var ia = CC_LEGACY_BUCKETS.indexOf(a.slotKey); if (ia === -1) ia = CC_LEGACY_BUCKETS.length;
+      var ib = CC_LEGACY_BUCKETS.indexOf(b.slotKey); if (ib === -1) ib = CC_LEGACY_BUCKETS.length;
+      if (ia !== ib) return ia - ib;
+      return a.slotKey < b.slotKey ? -1 : (a.slotKey > b.slotKey ? 1 : 0);
+    });
+    return out;
+  }
+
+  // The columns a card renders: resolved slots UNIONED with any bucket that
+  // already holds media (mirrors the CRM's ccRenderSlots — a dropped snapshot
+  // must never hide uploaded artwork).
+  function ccSlotsForCard(meta, posts) {
+    var slots = ccSlotsOf(meta);
+    var have = {};
+    slots.forEach(function (s) { have[s.slotKey] = true; });
+    posts.forEach(function (p) {
+      var m = p && p.media;
+      if (!m || typeof m !== 'object') return;
+      Object.keys(m).forEach(function (k) {
+        if (!have[k] && Array.isArray(m[k]) && m[k].length) {
+          have[k] = true;
+          slots.push({ slotKey: k, label: CC_SLOT_LABELS[k] || k });
+        }
+      });
+    });
+    return slots;
+  }
+
+  function ccPostMedia(post, slotKey) {
+    var m = post && post.media;
+    var list = (m && typeof m === 'object') ? m[slotKey] : null;
+    if (!Array.isArray(list)) return [];
+    return list.filter(function (e) { return e && (e.url || e.href); });
+  }
+
+  // Post identity for captionEdits / approve bodies: stable postUid when the
+  // CRM has stamped one, positional index otherwise (the CRM resolves both).
+  function ccUidOf(post, idx) {
+    return (post && post.postUid) ? String(post.postUid) : String(idx);
+  }
+
+  function ccSlotsWithMedia(slots, post) {
+    return slots.filter(function (s) { return ccPostMedia(post, s.slotKey).length > 0; });
+  }
+
+  function ccPostApproved(slots, post) {
+    var withMedia = ccSlotsWithMedia(slots, post);
+    if (!withMedia.length) return false;
+    return withMedia.every(function (s) { return post.approvals && post.approvals[s.slotKey] === true; });
+  }
+
+  function renderContentCalendarCard(portalToken, d) {
+    var meta = metaOf(d);
+    var posts = postsOf(d);
+    var slots = ccSlotsForCard(meta, posts);
+    var used = parseInt(meta.changeRequestRoundsUsed, 10) || 0;
+    var state = {
+      posts: posts,
+      slots: slots,
+      captionEdits: {},
+      marks: {},
+      notes: {},
+      roundsLeft: Math.max(0, CC_MAX_ROUNDS - used),
+      readOnly: false,
+      card: null,
+      refreshFooter: function () {},
+    };
+    state.readOnly = state.roundsLeft <= 0;
+
+    var allApproved = posts.length > 0 && posts.every(function (p) {
+      return ccSlotsWithMedia(slots, p).length === 0 || ccPostApproved(slots, p);
+    }) && posts.some(function (p) { return ccSlotsWithMedia(slots, p).length > 0; });
+
+    var head = el('div', { class: 'cp-card-head' }, [
+      el('div', {}, [
+        el('h2', { class: 'cp-card-title', text: d.title || d.name || 'Content Calendar' }),
+        el('div', { class: 'cp-wd-round', text: 'Content approval' }),
+      ]),
+      allApproved
+        ? el('span', { class: 'cp-badge cp-badge-approved', text: 'Approved' })
+        : el('span', { class: 'cp-badge cp-badge-action', text: 'Approval required' }),
+    ]);
+
+    var card = el('div', { class: 'cp-card cp-cc-card ' + (allApproved ? 'cp-card-approved' : 'cp-card-action') }, [head]);
+    state.card = card;
+
+    if (meta.approvalDate) {
+      card.appendChild(el('p', { class: 'cp-note', text: 'Approved on ' + formatDate(meta.approvalDate) }));
+    }
+
+    if (!posts.length) {
+      card.appendChild(el('p', { class: 'cp-note', text: 'No posts to review for this calendar yet.' }));
+      return card;
+    }
+
+    card.appendChild(el('p', {
+      class: 'cp-note',
+      text: 'Review each post below. You can edit captions directly, approve a post, or mark artwork for changes and send everything in one round.',
+    }));
+
+    var headRow = el('tr', {}, [
+      el('th', { text: '#' }),
+      el('th', { text: 'Post date' }),
+      el('th', { class: 'cp-cc-th-caption', text: 'Caption' }),
+    ]);
+    slots.forEach(function (s) { headRow.appendChild(el('th', { text: s.label })); });
+    headRow.appendChild(el('th', { text: 'Actions' }));
+
+    var tbody = el('tbody');
+    posts.forEach(function (post, idx) {
+      var tr = el('tr', { class: 'cp-cc-row' });
+      tr.appendChild(el('td', { 'data-label': '#', class: 'cp-cc-num', text: String(idx + 1) }));
+      tr.appendChild(el('td', { 'data-label': 'Post date', text: post.postDate ? formatDate(post.postDate) : '—' }));
+      var tdCap = el('td', { 'data-label': 'Caption', class: 'cp-cc-td-caption' });
+      tdCap.appendChild(renderCcCaptionCell(state, post, idx));
+      tr.appendChild(tdCap);
+      slots.forEach(function (s) {
+        var td = el('td', { 'data-label': s.label });
+        td.appendChild(renderCcMediaCell(state, post, idx, s));
+        tr.appendChild(td);
+      });
+      var tdAct = el('td', { 'data-label': 'Actions' });
+      tdAct.appendChild(renderCcActionsCell(state, portalToken, d, post, idx));
+      tr.appendChild(tdAct);
+      tbody.appendChild(tr);
+    });
+
+    var table = el('table', { class: 'cp-cc-table' }, [el('thead', {}, [headRow]), tbody]);
+    var tablewrap = el('div', { class: 'cp-cc-tablewrap' }, [table]);
+    card.appendChild(tablewrap);
+
+    // ── Footer: pending summary + one submit = one change round ────
+    var pendingText = el('span', { class: 'cp-cc-pending' });
+    var warn = el('div', { class: 'cp-warn', hidden: true });
+    var submitBtn = el('button', { class: 'cp-btn cp-btn-primary', type: 'button' });
+    submitBtn.addEventListener('click', function () {
+      submitCcChanges(state, portalToken, d, submitBtn, warn);
+    });
+
+    state.refreshFooter = function () {
+      var count = Object.keys(state.captionEdits).length + Object.keys(state.notes).length;
+      Object.keys(state.marks).forEach(function (k) { count += state.marks[k].length; });
+      pendingText.textContent = count
+        ? (count + ' pending change' + (count === 1 ? '' : 's'))
+        : 'No changes selected yet';
+      submitBtn.textContent = 'Submit changes (' + state.roundsLeft + ' left)';
+      submitBtn.disabled = state.readOnly || count === 0;
+      if (state.card) {
+        if (count) state.card.setAttribute('data-cc-dirty', '1');
+        else state.card.removeAttribute('data-cc-dirty');
+      }
+    };
+
+    var footer = el('div', { class: 'cp-cc-footer' }, [pendingText, submitBtn]);
+    card.appendChild(footer);
+    card.appendChild(warn);
+    if (state.readOnly) {
+      card.appendChild(el('p', { class: 'cp-note cp-cc-exhausted', text: 'No change rounds left — please approve the remaining posts.' }));
+    }
+    state.refreshFooter();
+    return card;
+  }
+
+  function renderCcCaptionCell(state, post, idx) {
+    var uid = ccUidOf(post, idx);
+    var cell = el('div', { class: 'cp-cc-captionwrap' });
+    var editor = el('div', { class: 'cp-editor cp-cc-editor', html: post.captionHtml || '' });
+    if (state.readOnly) {
+      editor.setAttribute('contenteditable', 'false');
+      cell.appendChild(editor);
+      return cell;
+    }
+    editor.setAttribute('contenteditable', 'true');
+    var toolbar = el('div', { class: 'cp-toolbar' });
+    [['bold', 'B'], ['italic', 'I'], ['underline', 'U'], ['insertUnorderedList', '•']].forEach(function (pair) {
+      var b = el('button', { type: 'button', html: pair[1] });
+      b.addEventListener('mousedown', function (e) { e.preventDefault(); });
+      b.addEventListener('click', function () { document.execCommand(pair[0], false, null); editor.focus(); });
+      toolbar.appendChild(b);
+    });
+    var seed = editor.innerHTML;
+    editor.addEventListener('input', function () {
+      if (editor.innerHTML !== seed) state.captionEdits[uid] = editor.innerHTML;
+      else delete state.captionEdits[uid];
+      state.refreshFooter();
+    });
+    cell.appendChild(toolbar);
+    cell.appendChild(editor);
+    return cell;
+  }
+
+  function renderCcMediaCell(state, post, idx, slot) {
+    var uid = ccUidOf(post, idx);
+    var entries = ccPostMedia(post, slot.slotKey);
+    var cell = el('div', { class: 'cp-cc-mediacell' });
+    if (!entries.length) {
+      cell.appendChild(el('span', { class: 'cp-cc-empty', text: '—' }));
+      return cell;
+    }
+    var slotApproved = post.approvals && post.approvals[slot.slotKey] === true;
+    var imageUrls = entries.filter(function (e) {
+      return e.kind === 'image' || looksLikeImage(e.url);
+    }).map(function (e) { return assetUrl(e.url); });
+
+    entries.forEach(function (entry, i) {
+      var url = assetUrl(entry.url || entry.href);
+      var name = entry.name || ('file ' + (i + 1));
+      var item = el('div', { class: 'cp-cc-mediaitem' + (slotApproved ? ' cp-cc-slot-approved' : '') });
+      if (entry.kind === 'image' || (entry.kind == null && looksLikeImage(entry.url))) {
+        var img = el('img', { class: 'cp-cc-thumb', src: url, alt: name, loading: 'lazy' });
+        img.addEventListener('click', function () {
+          openImageLightbox(imageUrls, imageUrls.indexOf(url));
+        });
+        item.appendChild(img);
+      } else if (entry.kind === 'video' || looksLikeVideo(entry.url)) {
+        item.appendChild(el('video', { class: 'cp-cc-video', src: url, controls: true, preload: 'metadata' }));
+      } else {
+        item.appendChild(el('a', { class: 'cp-cc-link', href: url, target: '_blank', rel: 'noopener', text: name }));
+      }
+      if (slotApproved) {
+        item.appendChild(el('span', { class: 'cp-cc-approved-tick', text: '✓ Approved' }));
+      } else if (!state.readOnly) {
+        var markBtn = el('button', { class: 'cp-cc-markbtn', type: 'button', text: 'Request change' });
+        markBtn.addEventListener('click', function () {
+          var list = state.marks[uid] || (state.marks[uid] = []);
+          var key = slot.slotKey + '::' + (entry.url || i);
+          var at = -1;
+          for (var j = 0; j < list.length; j++) { if (list[j].key === key) { at = j; break; } }
+          if (at === -1) {
+            list.push({ key: key, slotLabel: slot.label || slot.slotKey, name: name });
+            item.classList.add('cp-cc-marked');
+            markBtn.textContent = 'Marked — undo';
+          } else {
+            list.splice(at, 1);
+            if (!list.length) delete state.marks[uid];
+            item.classList.remove('cp-cc-marked');
+            markBtn.textContent = 'Request change';
+          }
+          state.refreshFooter();
+        });
+        item.appendChild(markBtn);
+      }
+      cell.appendChild(item);
+    });
+    return cell;
+  }
+
+  function renderCcActionsCell(state, portalToken, deliverable, post, idx) {
+    var uid = ccUidOf(post, idx);
+    var cell = el('div', { class: 'cp-cc-actions' });
+    var withMedia = ccSlotsWithMedia(state.slots, post);
+    if (!withMedia.length) {
+      cell.appendChild(el('span', { class: 'cp-cc-empty', text: 'No media yet' }));
+      return cell;
+    }
+    if (ccPostApproved(state.slots, post)) {
+      cell.appendChild(el('span', { class: 'cp-post-approved-tag', text: '✓ Approved' }));
+      return cell;
+    }
+    var approveBtn = el('button', { class: 'cp-btn cp-btn-approve', type: 'button', text: 'Approve' });
+    approveBtn.addEventListener('click', function () {
+      approveCcPost(portalToken, deliverable, post, idx, state.slots, approveBtn);
+    });
+    cell.appendChild(approveBtn);
+    if (!state.readOnly) {
+      var note = el('textarea', { class: 'cp-textarea cp-cc-note', placeholder: 'Describe the change you need…' });
+      note.hidden = true;
+      note.addEventListener('input', function () {
+        if (note.value.trim()) state.notes[uid] = note.value;
+        else delete state.notes[uid];
+        state.refreshFooter();
+      });
+      var noteBtn = el('button', { class: 'cp-btn cp-cc-notebtn', type: 'button', text: 'Add note' });
+      noteBtn.addEventListener('click', function () {
+        note.hidden = !note.hidden;
+        noteBtn.textContent = note.hidden ? 'Add note' : 'Hide note';
+        if (!note.hidden) note.focus();
+      });
+      cell.appendChild(noteBtn);
+      cell.appendChild(note);
+    }
+    return cell;
+  }
+
+  // One click approves every size slot of this post that has media. The new
+  // CRM honours `sizes:'all'`; an older CRM ignores it and approves only
+  // `size`, so we detect the shortfall from the returned metadata and sweep
+  // the remaining slots per-size (deploy-order tolerance).
+  function approveCcPost(portalToken, deliverable, post, idx, slots, btn) {
+    var withMedia = ccSlotsWithMedia(slots, post);
+    if (!withMedia.length) return;
+    var token = currentRoute().token || portalToken;
+    if (btn) { btn.disabled = true; btn.textContent = 'Approving…'; }
+    api('POST', '/api/request-forms/public/portal/approve', {
+      deliverableId: deliverable.id,
+      postUid: post.postUid || undefined,
+      postIndex: idx,
+      size: withMedia[0].slotKey,
+      sizes: 'all',
+      portalToken: token,
+    }).then(function (res) {
+      if (!res.ok) throw res;
+      var returnedMeta = res.data && res.data.metadata;
+      if (typeof returnedMeta === 'string') {
+        try { returnedMeta = JSON.parse(returnedMeta); } catch (e) { returnedMeta = null; }
+      }
+      var remaining = [];
+      if (returnedMeta && Array.isArray(returnedMeta.posts)) {
+        var rp = null;
+        for (var i = 0; i < returnedMeta.posts.length; i++) {
+          if (ccUidOf(returnedMeta.posts[i], i) === ccUidOf(post, idx)) { rp = returnedMeta.posts[i]; break; }
+        }
+        if (rp) {
+          remaining = withMedia.filter(function (s) {
+            return !(rp.approvals && rp.approvals[s.slotKey] === true);
+          });
+        }
+      }
+      var chain = Promise.resolve();
+      remaining.forEach(function (s) {
+        chain = chain.then(function () {
+          return api('POST', '/api/request-forms/public/portal/approve', {
+            deliverableId: deliverable.id,
+            postUid: post.postUid || undefined,
+            postIndex: idx,
+            size: s.slotKey,
+            portalToken: token,
+          });
+        });
+      });
+      return chain;
+    }).then(function () {
+      loadApprovals(token);
+    }).catch(function (res) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Approve'; }
+      alert((res && res.data && res.data.error) || 'Could not approve. Please try again.');
+    });
+  }
+
+  // ONE POST = ONE change round: aggregate every mark, note and caption edit
+  // into a single change-request body plus a captionEdits map keyed by post
+  // uid/index (the shape the CRM writes back into posts[].captionHtml).
+  function submitCcChanges(state, portalToken, deliverable, btn, warn) {
+    warn.hidden = true;
+    var lines = [];
+    state.posts.forEach(function (p, idx) {
+      var uid = ccUidOf(p, idx);
+      var label = 'Post ' + (idx + 1) + (p.postDate ? ' (' + formatDate(p.postDate) + ')' : '');
+      (state.marks[uid] || []).forEach(function (m) {
+        lines.push(label + ' — ' + m.slotLabel + ': change requested on "' + m.name + '"');
+      });
+      var note = (state.notes[uid] || '').trim();
+      if (note) lines.push(label + ' — note: ' + note);
+      if (state.captionEdits[uid] !== undefined) lines.push(label + ' — caption edited.');
+    });
+    if (!lines.length) {
+      warn.textContent = 'Mark artwork, add a note or edit a caption before submitting.';
+      warn.hidden = false;
+      return;
+    }
+    var token = currentRoute().token || portalToken;
+    btn.disabled = true;
+    btn.textContent = 'Sending…';
+    api('POST', '/api/request-forms/public/portal/change-request', {
+      deliverableId: deliverable.id,
+      body: lines.join('\n'),
+      captionEdits: state.captionEdits,
+      screenshots: [],
+      portalToken: token,
+    }).then(function (res) {
+      if (res.ok) {
+        if (state.card) state.card.removeAttribute('data-cc-dirty');
+        loadApprovals(token);
+      } else if (res.status === 409) {
+        state.roundsLeft = 0;
+        state.readOnly = true;
+        btn.textContent = 'Submit changes (0 left)';
+        warn.textContent = 'No change rounds left — please approve.';
+        warn.hidden = false;
+      } else {
+        btn.disabled = false;
+        state.refreshFooter();
+        warn.textContent = (res.data && res.data.error) || 'Could not send. Please try again.';
+        warn.hidden = false;
+      }
+    }).catch(function () {
+      btn.disabled = false;
+      state.refreshFooter();
+      warn.textContent = 'Could not send. Please try again.';
+      warn.hidden = false;
+    });
+  }
+
+  // ── Focus-points card (status materials_requested / focus_points_sent) ──
+  // The month's plan before artwork exists: per-post date + focus-points text.
+  // Edits save per row on blur via the CRM's focus-points/description endpoint
+  // (dates are locked server-side); one Approve advances the whole calendar to
+  // materials_received. No change-round cap at this stage.
+  function renderCcFocusPointsCard(portalToken, d) {
+    var posts = postsOf(d);
+    var token = currentRoute().token || portalToken;
+
+    var head = el('div', { class: 'cp-card-head' }, [
+      el('div', {}, [
+        el('h2', { class: 'cp-card-title', text: d.title || d.name || 'Content Calendar' }),
+        el('div', { class: 'cp-wd-round', text: 'Focus points approval' }),
+      ]),
+      el('span', { class: 'cp-badge cp-badge-action', text: 'Approval required' }),
+    ]);
+    var card = el('div', { class: 'cp-card cp-card-action cp-cc-card' }, [head]);
+
+    if (!posts.length) {
+      card.appendChild(el('p', { class: 'cp-note', text: 'No focus points to review for this calendar yet.' }));
+      return card;
+    }
+
+    card.appendChild(el('p', {
+      class: 'cp-note',
+      text: 'These are the planned focus points for each post. Edit the text directly if you want something different — changes save automatically — then approve to move production ahead.',
+    }));
+
+    var headRow = el('tr', {}, [
+      el('th', { text: '#' }),
+      el('th', { text: 'Post date' }),
+      el('th', { class: 'cp-cc-th-caption', text: 'Focus points' }),
+    ]);
+    var tbody = el('tbody');
+    posts.forEach(function (post, idx) {
+      var tr = el('tr', { class: 'cp-cc-row' });
+      tr.appendChild(el('td', { 'data-label': '#', class: 'cp-cc-num', text: String(idx + 1) }));
+      tr.appendChild(el('td', { 'data-label': 'Post date', text: post.postDate ? formatDate(post.postDate) : '—' }));
+      var td = el('td', { 'data-label': 'Focus points', class: 'cp-cc-td-caption' });
+      var editor = el('div', { class: 'cp-editor cp-cc-editor', contenteditable: 'true', html: post.captionHtml || '' });
+      var indicator = el('span', { class: 'cp-cc-saveflag', text: '' });
+      var seed = editor.innerHTML;
+      editor.addEventListener('blur', function () {
+        var html = editor.innerHTML;
+        if (html === seed) return;
+        indicator.textContent = 'Saving…';
+        api('POST', '/api/request-forms/public/portal/focus-points/description', {
+          deliverableId: d.id,
+          postUid: post.postUid || undefined,
+          postIndex: idx,
+          description: html,
+          portalToken: token,
+        }).then(function (res) {
+          if (res.ok) {
+            seed = html;
+            indicator.textContent = 'Saved';
+          } else {
+            editor.innerHTML = seed;
+            indicator.textContent = (res.data && res.data.error) || 'Could not save — reverted.';
+          }
+        }).catch(function () {
+          editor.innerHTML = seed;
+          indicator.textContent = 'Could not save — reverted.';
+        });
+      });
+      td.appendChild(editor);
+      td.appendChild(indicator);
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    });
+
+    var table = el('table', { class: 'cp-cc-table cp-cc-fp-table' }, [el('thead', {}, [headRow]), tbody]);
+    card.appendChild(el('div', { class: 'cp-cc-tablewrap' }, [table]));
+
+    var warn = el('div', { class: 'cp-warn', hidden: true });
+    var approveBtn = el('button', { class: 'cp-btn cp-btn-approve', type: 'button', text: 'Approve focus points' });
+    approveBtn.addEventListener('click', function () {
+      approveBtn.disabled = true;
+      approveBtn.textContent = 'Approving…';
+      api('POST', '/api/request-forms/public/portal/focus-points/approve', {
+        deliverableId: d.id,
+        portalToken: token,
+      }).then(function (res) {
+        if (res.ok) {
+          loadApprovals(token);
+        } else {
+          approveBtn.disabled = false;
+          approveBtn.textContent = 'Approve focus points';
+          warn.textContent = (res.data && res.data.error) || 'Could not approve. Please try again.';
+          warn.hidden = false;
+        }
+      }).catch(function () {
+        approveBtn.disabled = false;
+        approveBtn.textContent = 'Approve focus points';
+        warn.textContent = 'Could not approve. Please try again.';
+        warn.hidden = false;
+      });
+    });
+    card.appendChild(el('div', { class: 'cp-cc-footer' }, [approveBtn]));
+    card.appendChild(warn);
+    return card;
   }
 
   // ════════════════════════════════════════════════════════════════
@@ -2416,10 +2992,28 @@
       uploads: collected.uploads || []
     };
     if (!prefill.bfId) {
-      // No routing target — nothing to post back to. Acknowledge anyway.
-      return render(thankYouState('Your video request has been recorded. Thank you!'));
+      // No routing target, so this submission CANNOT be saved anywhere. Telling the
+      // client "recorded, thank you" was a silent data-loss path: they fill the whole
+      // form, see success, and nothing is ever written. Fail honestly instead.
+      return render(errorState(
+        'We could not submit your request because this form link is incomplete. ' +
+        'Please contact ProAgri and we will send you a fresh link.'
+      ));
     }
-    var body = Object.assign({ video_index: prefill.videoIndex || null }, legacy, dynamic);
+    // rowId is the ONLY unambiguous routing target. Without it the CRM falls back to a
+    // (booking_form_id, video_index) lookup that ignores delivery_month, so ONE
+    // submission fans out across EVERY month of the campaign, and a row whose
+    // metadata.video_index is blank records nothing at all while the client still sees
+    // a success screen.
+    //
+    // The key must be `rowId`: the CRM runs req.body through toSnakeBody(), so this
+    // arrives as `row_id`, which is one of the names its lookup already accepts
+    // (routes/booking-forms.js reads prefill_row_id || prefillRowId || row_id || rowId).
+    // Sending `deliverable_id` would be silently ignored.
+    var body = Object.assign({
+      video_index: prefill.videoIndex || null,
+      rowId: prefill.rowId || null,
+    }, legacy, dynamic);
     api('POST', '/api/booking-forms/' + encodeURIComponent(prefill.bfId) + '/video-request-callback', body)
       .then(function (res) {
         if (res.ok) {
@@ -2514,6 +3108,18 @@
       wrap.appendChild(go);
     }
 
+    // Entry point for the video-request-forms view. This is the ONLY link to it:
+    // nothing else in either app points at /video-forms/, and without this the view
+    // is reachable only by typing the URL by hand. Shown unconditionally rather than
+    // gated on a count, because the point of the feature is filling FUTURE months in
+    // advance, so an empty-right-now list is still a place the client should be able
+    // to go and look.
+    wrap.appendChild(el('a', {
+      class: 'cp-dash-link',
+      href: '/video-forms/' + encodeURIComponent(portalToken),
+      text: 'Fill in your video request forms →',
+    }));
+
     wrap.appendChild(el('h2', { class: 'cp-h2', text: 'Previous approvals' }));
     if (!recent.length) {
       wrap.appendChild(el('div', { class: 'cp-empty' }, [
@@ -2536,6 +3142,127 @@
     }
     render(wrap);
     afterRenderRestore();
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // FLOW 5 — VIDEO REQUEST FORMS   /video-forms/:portalToken
+  // ════════════════════════════════════════════════════════════════
+  // Every video request form this client still has to fill in (or has already
+  // sent), grouped by delivery month, NEWEST MONTH FIRST. The CRM does the
+  // grouping AND the ordering, so this view renders data.months exactly as it
+  // arrives — it never re-groups or re-sorts.
+  //
+  // Each row LINKS OUT to the existing /video-request route rather than mounting
+  // the form inline: form-render.js's mount lifecycle is only ever exercised
+  // once per page, so N inline mounts is unverified ground.
+  function loadVideoForms(portalToken, silent) {
+    if (!silent) render(el('div', { class: 'cp-loading', text: 'Loading your video request forms…' }));
+    api('GET', '/api/request-forms/public/portal/' + encodeURIComponent(portalToken) + '/video-forms').then(function (r) {
+      if (!r.ok || !r.data) {
+        if (!silent) render(errorState('Could not load your video request forms. The link may be invalid.'));
+        return;
+      }
+      renderVideoForms(portalToken, r.data);
+      startSync('video-forms', portalToken, null, loadVideoForms);
+    }).catch(function () {
+      if (!silent) render(errorState('Could not load your video request forms. Please try again.'));
+    });
+  }
+
+  function renderVideoForms(portalToken, data) {
+    var client = data && data.client ? data.client : null;
+    var months = data && Array.isArray(data.months) ? data.months : [];
+
+    var wrap = el('div', {}, [
+      el('h1', { class: 'cp-h1', text: 'Video Request Forms' }),
+      el('p', {
+        class: 'cp-sub',
+        text: client && client.name
+          ? 'For ' + client.name + '. Please complete one form per video.'
+          : 'Please complete one form per video.',
+      }),
+      el('a', { class: 'cp-dash-link', href: '/dashboard/' + encodeURIComponent(portalToken),
+        text: '← Back to dashboard' }),
+    ]);
+
+    // Drop months carrying no forms instead of rendering a bare heading, so
+    // "nothing to fill in" collapses to the single empty state below.
+    var groups = months.filter(function (m) { return m && Array.isArray(m.forms) && m.forms.length; });
+
+    if (!groups.length) {
+      wrap.appendChild(el('div', { class: 'cp-empty' }, [
+        el('p', { text: 'You have no video request forms to complete right now.' }),
+      ]));
+      render(wrap);
+      return afterRenderRestore();
+    }
+
+    groups.forEach(function (m, i) {
+      // .cp-form-section only spaces ADJACENT sections (the `+` rule), so the
+      // first month heading would otherwise butt straight up against the back
+      // link above it. Inline margin keeps the fix inside this view.
+      var section = el('div', { class: 'cp-form-section', style: i === 0 ? 'margin-top:22px' : null });
+      // formatMonth() returns '' for a missing/unparseable key. A month key is
+      // only ever absent when the deliverable has no delivery_month, so label
+      // the group rather than hiding its forms.
+      section.appendChild(el('h2', {
+        class: 'cp-section-title',
+        text: formatMonth(m.month) || 'Month to be confirmed',
+      }));
+      var list = el('div', { class: 'cp-dash-list' });
+      m.forms.forEach(function (f) { list.appendChild(videoFormRow(f)); });
+      section.appendChild(list);
+      wrap.appendChild(section);
+    });
+
+    render(wrap);
+    afterRenderRestore();
+  }
+
+  // One row per video request form.
+  //
+  // A month in the FUTURE is the normal case here — briefing ahead of the shoot
+  // is the entire point of this view — so a row is NEVER disabled, greyed, or
+  // warned about because of its delivery month. Do not add a "this month has
+  // not started" gate.
+  //
+  // f.status is the deliverable's internal chain token ('send_video_form', …),
+  // i.e. staff language, so the hint is derived from f.submitted instead of
+  // printing the raw token at the client.
+  function videoFormRow(f) {
+    var submitted = !!(f && f.submitted);
+    var title = (f && f.title) || ('Video request' + (f && f.videoIndex ? ' #' + f.videoIndex : ''));
+
+    var row = el('div', { class: 'cp-dash-row' }, [
+      el('div', { class: 'cp-card-head' }, [
+        el('div', { class: 'cp-dash-row-title', text: title }),
+        submitted
+          ? el('span', { class: 'cp-badge cp-badge-approved', text: 'Submitted' })
+          : el('span', { class: 'cp-badge cp-badge-action', text: 'To complete' }),
+      ]),
+      el('div', {
+        class: 'cp-dash-row-meta',
+        text: submitted
+          ? 'You have sent us this brief. Open it to see what you submitted.'
+          : 'Not sent yet. Open the form to brief our team on this video.',
+      }),
+    ]);
+
+    // Use the server's prefillUrl VERBATIM — never rebuild it here. It is the
+    // only place bfId + videoIndex are guaranteed to travel together, and
+    // vrfSubmitAll() silently renders a thank-you and posts NOTHING when
+    // prefill.bfId is missing, so a hand-assembled link would swallow the
+    // client's submission with no error at all.
+    if (f && f.prefillUrl) {
+      row.appendChild(el('a', {
+        class: 'cp-dash-link', href: f.prefillUrl,
+        text: submitted ? 'Review your answers →' : 'Open the form →',
+      }));
+    } else {
+      row.appendChild(el('p', { class: 'cp-note',
+        text: 'This form is not ready yet. Please contact ProAgri.' }));
+    }
+    return row;
   }
 
   // ── Router (path-based, with hash fallback) ──────────────────────
@@ -2562,9 +3289,12 @@
       return { view: 'preview', token: null, itemId: decodeURIComponent(pv[1]) };
     }
 
-    var m = p.match(/^\/(form|approvals|dashboard)\/([^\/]+)/);
+    // 'video-forms' is listed FIRST so the alternation can never be shadowed by
+    // a shorter prefix as more views are added (the pattern is anchored, so
+    // '/video-forms/x' cannot match the 'form' branch today either).
+    var m = p.match(/^\/(video-forms|form|approvals|dashboard)\/([^\/]+)/);
     if (!m && window.location.hash) {
-      m = window.location.hash.replace(/^#/, '').match(/^\/?(form|approvals|dashboard)\/([^\/]+)/);
+      m = window.location.hash.replace(/^#/, '').match(/^\/?(video-forms|form|approvals|dashboard)\/([^\/]+)/);
     }
     if (m) return { view: m[1], token: decodeURIComponent(m[2]) };
     return { view: null, token: null };
@@ -2578,6 +3308,7 @@
     if (r.view === 'form' && r.token) return loadForm(r.token);
     if (r.view === 'approvals' && r.token) return loadApprovals(r.token);
     if (r.view === 'dashboard' && r.token) return loadDashboard(r.token);
+    if (r.view === 'video-forms' && r.token) return loadVideoForms(r.token);
     return render(landing());
   }
 
