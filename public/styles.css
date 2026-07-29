@@ -787,6 +787,12 @@ body {
   min-height: 60px;
   font-size: 13px;
 }
+/* Desktop: long multi-platform captions scroll inside the cell so 12 posts
+   don't become a 12,000px page. Nothing is truncated — the cell scrolls.
+   Mobile keeps captions full-length in the stacked cards. */
+@media (min-width: 561px) {
+  .cp-cc-editor { max-height: 320px; overflow-y: auto; }
+}
 .cp-cc-captionwrap .cp-toolbar { margin-bottom: 4px; }
 .cp-cc-mediacell { display: flex; flex-direction: column; gap: 8px; }
 .cp-cc-mediaitem {
@@ -843,8 +849,9 @@ body {
   }
   .cp-cc-td-caption { min-width: 0; }
   .cp-cc-note { width: 100%; }
-  /* Blank media slots are noise in the stacked layout. */
-  .cp-cc-td-blank { display: none; }
+  /* Blank media slots are noise in the stacked layout. (Needs the extra
+     .cp-cc-table td qualifier to outrank the display:block collapse rule.) */
+  .cp-cc-table td.cp-cc-td-blank { display: none; }
   /* "#" collapses to a bold "Post N" line instead of a labelled field. */
   .cp-cc-table td.cp-cc-num { font-size: 15px; font-weight: 800; color: var(--cp-text); padding-top: 10px; }
   .cp-cc-table td.cp-cc-num::before {
