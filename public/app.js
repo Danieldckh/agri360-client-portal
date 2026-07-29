@@ -892,7 +892,14 @@
         }
       });
     });
-    return slots;
+    // Client view: drop columns with zero media across the whole calendar —
+    // an all-"—" column is dead width the client can do nothing with. (The
+    // approval gate only counts slots WITH media, so nothing is lost.) Keep
+    // every column when none has media, so the table still has its shape.
+    var withAny = slots.filter(function (s) {
+      return posts.some(function (p) { return ccPostMedia(p, s.slotKey).length > 0; });
+    });
+    return withAny.length ? withAny : slots;
   }
 
   function ccPostMedia(post, slotKey) {
