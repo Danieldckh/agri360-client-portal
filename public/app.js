@@ -984,7 +984,10 @@
       tdCap.appendChild(renderCcCaptionCell(state, post, idx));
       tr.appendChild(tdCap);
       slots.forEach(function (s) {
-        var td = el('td', { 'data-label': s.label });
+        var hasMedia = ccPostMedia(post, s.slotKey).length > 0;
+        // Blank slots collapse on mobile — a "Vertical (Story) —" field is
+        // pure noise in the stacked card layout.
+        var td = el('td', { 'data-label': s.label, class: hasMedia ? null : 'cp-cc-td-blank' });
         td.appendChild(renderCcMediaCell(state, post, idx, s));
         tr.appendChild(td);
       });

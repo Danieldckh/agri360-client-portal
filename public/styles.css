@@ -784,7 +784,7 @@ body {
 .cp-cc-num { color: var(--cp-text-muted); font-weight: 700; }
 .cp-cc-th-caption, .cp-cc-td-caption { min-width: 200px; }
 .cp-cc-editor {
-  min-height: 60px; max-height: 220px; overflow-y: auto;
+  min-height: 60px;
   font-size: 13px;
 }
 .cp-cc-captionwrap .cp-toolbar { margin-bottom: 4px; }
@@ -795,9 +795,10 @@ body {
 }
 .cp-cc-mediaitem.cp-cc-marked { border-color: var(--cp-primary); background: var(--cp-primary-soft); }
 .cp-cc-thumb {
-  width: 84px; height: 84px; object-fit: cover; border-radius: 6px;
+  width: 96px; height: 96px; object-fit: cover; border-radius: 6px;
   cursor: zoom-in; border: 1px solid var(--cp-border);
   display: block;
+  background: var(--cp-surface-2);
 }
 .cp-cc-video { width: 150px; max-width: 100%; border-radius: 6px; }
 .cp-cc-link { color: var(--cp-primary); font-size: 12px; word-break: break-all; }
@@ -842,4 +843,12 @@ body {
   }
   .cp-cc-td-caption { min-width: 0; }
   .cp-cc-note { width: 100%; }
+  /* Blank media slots are noise in the stacked layout. */
+  .cp-cc-td-blank { display: none; }
+  /* "#" collapses to a bold "Post N" line instead of a labelled field. */
+  .cp-cc-table td.cp-cc-num { font-size: 15px; font-weight: 800; color: var(--cp-text); padding-top: 10px; }
+  .cp-cc-table td.cp-cc-num::before {
+    content: 'Post '; display: inline; font-size: 15px; font-weight: 800;
+    letter-spacing: 0; text-transform: none; color: var(--cp-text); margin-bottom: 0;
+  }
 }
