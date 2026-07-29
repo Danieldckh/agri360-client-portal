@@ -928,27 +928,47 @@
     return withMedia.every(function (s) { return post.approvals && post.approvals[s.slotKey] === true; });
   }
 
+  // ── Slider view ──────────────────────────────────────────────────
+  // One post at a time, previewed like a social post: artwork on top
+  // (carousel when several), editable caption below. The client must decide
+  // each post — Approve or Request changes — before moving on; Back is always
+  // allowed. Change requests are image-scoped marks that queue locally and go
+  // out as ONE round from the summary slide. The round counter sits above the
+  // slider.
   function renderContentCalendarCard(portalToken, d) {
     var meta = metaOf(d);
     var posts = postsOf(d);
     var slots = ccSlotsForCard(meta, posts);
     var used = parseInt(meta.changeRequestRoundsUsed, 10) || 0;
+
     var state = {
+      d: d,
+      token: currentRoute().token || portalToken,
       posts: posts,
       slots: slots,
       captionEdits: {},
       marks: {},
       notes: {},
+      decisions: [],
+      idx: 0,
+      view: 'slide',
       roundsLeft: Math.max(0, CC_MAX_ROUNDS - used),
-      readOnly: false,
-      card: null,
-      refreshFooter: function () {},
+      card: null, topBar: null, stage: null, nav: null,
     };
     state.readOnly = state.roundsLeft <= 0;
 
-    var allApproved = posts.length > 0 && posts.every(function (p) {
-      return ccSlotsWithMedia(slots, p).length === 0 || ccPostApproved(slots, p);
-    }) && posts.some(function (p) { return ccSlotsWithMedia(slots, p).length > 0; });
+    posts.forEach(function (p, i) {
+      if (!ccSlotsWithMedia(slots, p).length) state.decisions[i] = 'skip';
+      else if (ccPostApproved(slots, p)) state.decisions[i] = 'approved';
+      else state.decisions[i] = null;
+    });
+    var firstOpen = ccsFirstOpen(state);
+    if (firstOpen === -1 && posts.length) state.view = 'summary';
+    else state.idx = firstOpen === -1 ? 0 : firstOpen;
+
+    var allApproved = posts.length > 0 && firstOpen === -1 &&
+      posts.some(function (p) { return ccSlotsWithMedia(slots, p).length > 0; }) &&
+      !state.decisions.some(function (dec) { return dec === 'changes'; });
 
     var head = el('div', { class: 'cp-card-head' }, [
       el('div', {}, [
@@ -960,226 +980,346 @@
         : el('span', { class: 'cp-badge cp-badge-action', text: 'Approval required' }),
     ]);
 
-    var card = el('div', { class: 'cp-card cp-cc-card ' + (allApproved ? 'cp-card-approved' : 'cp-card-action') }, [head]);
+    var card = el('div', { class: 'cp-card cp-ccs-card ' + (allApproved ? 'cp-card-approved' : 'cp-card-action') }, [head]);
     state.card = card;
 
     if (meta.approvalDate) {
       card.appendChild(el('p', { class: 'cp-note', text: 'Approved on ' + formatDate(meta.approvalDate) }));
     }
-
     if (!posts.length) {
       card.appendChild(el('p', { class: 'cp-note', text: 'No posts to review for this calendar yet.' }));
       return card;
     }
 
-    card.appendChild(el('p', {
-      class: 'cp-note',
-      text: 'Review each post below. You can edit captions directly, approve a post, or mark artwork for changes and send everything in one round.',
-    }));
-
-    var headRow = el('tr', {}, [
-      el('th', { text: '#' }),
-      el('th', { text: 'Post date' }),
-      el('th', { class: 'cp-cc-th-caption', text: 'Caption' }),
-    ]);
-    slots.forEach(function (s) { headRow.appendChild(el('th', { text: s.label })); });
-    headRow.appendChild(el('th', { text: 'Actions' }));
-
-    var tbody = el('tbody');
-    posts.forEach(function (post, idx) {
-      var tr = el('tr', { class: 'cp-cc-row' });
-      tr.appendChild(el('td', { 'data-label': '#', class: 'cp-cc-num', text: String(idx + 1) }));
-      tr.appendChild(el('td', { 'data-label': 'Post date', text: post.postDate ? formatDate(post.postDate) : '—' }));
-      var tdCap = el('td', { 'data-label': 'Caption', class: 'cp-cc-td-caption' });
-      tdCap.appendChild(renderCcCaptionCell(state, post, idx));
-      tr.appendChild(tdCap);
-      slots.forEach(function (s) {
-        var hasMedia = ccPostMedia(post, s.slotKey).length > 0;
-        // Blank slots collapse on mobile — a "Vertical (Story) —" field is
-        // pure noise in the stacked card layout.
-        var td = el('td', { 'data-label': s.label, class: hasMedia ? null : 'cp-cc-td-blank' });
-        td.appendChild(renderCcMediaCell(state, post, idx, s));
-        tr.appendChild(td);
-      });
-      var tdAct = el('td', { 'data-label': 'Actions' });
-      tdAct.appendChild(renderCcActionsCell(state, portalToken, d, post, idx));
-      tr.appendChild(tdAct);
-      tbody.appendChild(tr);
-    });
-
-    var table = el('table', { class: 'cp-cc-table' }, [el('thead', {}, [headRow]), tbody]);
-    var tablewrap = el('div', { class: 'cp-cc-tablewrap' }, [table]);
-    card.appendChild(tablewrap);
-
-    // ── Footer: pending summary + one submit = one change round ────
-    var pendingText = el('span', { class: 'cp-cc-pending' });
-    var warn = el('div', { class: 'cp-warn', hidden: true });
-    var submitBtn = el('button', { class: 'cp-btn cp-btn-primary', type: 'button' });
-    submitBtn.addEventListener('click', function () {
-      submitCcChanges(state, portalToken, d, submitBtn, warn);
-    });
-
-    state.refreshFooter = function () {
-      var count = Object.keys(state.captionEdits).length + Object.keys(state.notes).length;
-      Object.keys(state.marks).forEach(function (k) { count += state.marks[k].length; });
-      pendingText.textContent = count
-        ? (count + ' pending change' + (count === 1 ? '' : 's'))
-        : 'No changes selected yet';
-      submitBtn.textContent = 'Submit changes (' + state.roundsLeft + ' left)';
-      submitBtn.disabled = state.readOnly || count === 0;
-      if (state.card) {
-        if (count) state.card.setAttribute('data-cc-dirty', '1');
-        else state.card.removeAttribute('data-cc-dirty');
-      }
-    };
-
-    var footer = el('div', { class: 'cp-cc-footer' }, [pendingText, submitBtn]);
-    card.appendChild(footer);
-    card.appendChild(warn);
-    if (state.readOnly) {
-      card.appendChild(el('p', { class: 'cp-note cp-cc-exhausted', text: 'No change rounds left — please approve the remaining posts.' }));
-    }
-    state.refreshFooter();
+    state.topBar = el('div', { class: 'cp-ccs-top' });
+    state.stage = el('div', { class: 'cp-ccs-stage' });
+    state.nav = el('div', { class: 'cp-ccs-nav' });
+    card.appendChild(state.topBar);
+    card.appendChild(state.stage);
+    card.appendChild(state.nav);
+    ccsRender(state);
     return card;
   }
 
-  function renderCcCaptionCell(state, post, idx) {
-    var uid = ccUidOf(post, idx);
-    var cell = el('div', { class: 'cp-cc-captionwrap' });
-    var editor = el('div', { class: 'cp-editor cp-cc-editor', html: post.captionHtml || '' });
-    if (state.readOnly) {
-      editor.setAttribute('contenteditable', 'false');
-      cell.appendChild(editor);
-      return cell;
+  function ccsFirstOpen(state) {
+    for (var i = 0; i < state.posts.length; i++) {
+      if (state.decisions[i] == null) return i;
     }
-    editor.setAttribute('contenteditable', 'true');
-    var toolbar = el('div', { class: 'cp-toolbar' });
-    [['bold', 'B'], ['italic', 'I'], ['underline', 'U'], ['insertUnorderedList', '•']].forEach(function (pair) {
-      var b = el('button', { type: 'button', html: pair[1] });
-      b.addEventListener('mousedown', function (e) { e.preventDefault(); });
-      b.addEventListener('click', function () { document.execCommand(pair[0], false, null); editor.focus(); });
-      toolbar.appendChild(b);
-    });
-    var seed = editor.innerHTML;
-    editor.addEventListener('input', function () {
-      if (editor.innerHTML !== seed) state.captionEdits[uid] = editor.innerHTML;
-      else delete state.captionEdits[uid];
-      state.refreshFooter();
-    });
-    cell.appendChild(toolbar);
-    cell.appendChild(editor);
-    return cell;
+    return -1;
   }
 
-  function renderCcMediaCell(state, post, idx, slot) {
-    var uid = ccUidOf(post, idx);
-    var entries = ccPostMedia(post, slot.slotKey);
-    var cell = el('div', { class: 'cp-cc-mediacell' });
-    if (!entries.length) {
-      cell.appendChild(el('span', { class: 'cp-cc-empty', text: '—' }));
-      return cell;
-    }
-    var slotApproved = post.approvals && post.approvals[slot.slotKey] === true;
-    var imageUrls = entries.filter(function (e) {
-      return e.kind === 'image' || looksLikeImage(e.url);
-    }).map(function (e) { return assetUrl(e.url); });
+  function ccsPendingCount(state) {
+    var count = Object.keys(state.captionEdits).length + Object.keys(state.notes).length;
+    Object.keys(state.marks).forEach(function (k) { count += state.marks[k].length; });
+    return count;
+  }
 
-    entries.forEach(function (entry, i) {
-      var url = assetUrl(entry.url || entry.href);
-      var name = entry.name || ('file ' + (i + 1));
-      var item = el('div', { class: 'cp-cc-mediaitem' + (slotApproved ? ' cp-cc-slot-approved' : '') });
-      if (entry.kind === 'image' || (entry.kind == null && looksLikeImage(entry.url))) {
-        var img = el('img', { class: 'cp-cc-thumb', src: url, alt: name, loading: 'lazy' });
-        img.addEventListener('click', function () {
-          openImageLightbox(imageUrls, imageUrls.indexOf(url));
+  function ccsSyncDirty(state) {
+    if (!state.card) return;
+    // Queued marks / notes / caption edits AND undecided-yet-changed slides
+    // live only in the DOM — block the background poll from wiping them.
+    if (ccsPendingCount(state) > 0) state.card.setAttribute('data-cc-dirty', '1');
+    else state.card.removeAttribute('data-cc-dirty');
+  }
+
+  function ccsRender(state) {
+    ccsSyncDirty(state);
+    ccsRenderTop(state);
+    clear(state.stage);
+    state.stage.appendChild(state.view === 'summary' ? ccsSummary(state) : ccsSlide(state, state.idx));
+    ccsRenderNav(state);
+  }
+
+  function ccsRenderTop(state) {
+    clear(state.topBar);
+    var rounds = el('span', {
+      class: 'cp-ccs-rounds' + (state.roundsLeft <= 0 ? ' cp-ccs-rounds-empty' : ''),
+      text: 'Change rounds left: ' + state.roundsLeft + ' of ' + CC_MAX_ROUNDS,
+    });
+    var progress = el('span', {
+      class: 'cp-ccs-progress',
+      text: state.view === 'summary'
+        ? 'Review summary'
+        : 'Post ' + (state.idx + 1) + ' of ' + state.posts.length,
+    });
+    var dots = el('div', { class: 'cp-ccs-dots' });
+    var firstOpen = ccsFirstOpen(state);
+    state.posts.forEach(function (p, i) {
+      var cls = 'cp-ccs-dot';
+      var dec = state.decisions[i];
+      if (dec === 'approved' || dec === 'skip') cls += ' done';
+      else if (dec === 'changes') cls += ' changes';
+      if (state.view !== 'summary' && i === state.idx) cls += ' active';
+      var reachable = dec != null || i === firstOpen;
+      if (reachable) cls += ' reachable';
+      var dot = el('span', { class: cls, title: 'Post ' + (i + 1) });
+      if (reachable) {
+        dot.addEventListener('click', function () {
+          state.view = 'slide';
+          state.idx = i;
+          ccsRender(state);
         });
-        item.appendChild(img);
-      } else if (entry.kind === 'video' || looksLikeVideo(entry.url)) {
-        item.appendChild(el('video', { class: 'cp-cc-video', src: url, controls: true, preload: 'metadata' }));
-      } else {
-        item.appendChild(el('a', { class: 'cp-cc-link', href: url, target: '_blank', rel: 'noopener', text: name }));
       }
-      if (slotApproved) {
-        item.appendChild(el('span', { class: 'cp-cc-approved-tick', text: '✓ Approved' }));
-      } else if (!state.readOnly) {
-        var markBtn = el('button', { class: 'cp-cc-markbtn', type: 'button', text: 'Request change' });
-        markBtn.addEventListener('click', function () {
-          var list = state.marks[uid] || (state.marks[uid] = []);
-          var key = slot.slotKey + '::' + (entry.url || i);
-          var at = -1;
-          for (var j = 0; j < list.length; j++) { if (list[j].key === key) { at = j; break; } }
-          if (at === -1) {
-            list.push({ key: key, slotLabel: slot.label || slot.slotKey, name: name });
-            item.classList.add('cp-cc-marked');
-            markBtn.textContent = 'Marked — undo';
-          } else {
-            list.splice(at, 1);
-            if (!list.length) delete state.marks[uid];
-            item.classList.remove('cp-cc-marked');
-            markBtn.textContent = 'Request change';
+      dots.appendChild(dot);
+    });
+    state.topBar.appendChild(rounds);
+    state.topBar.appendChild(progress);
+    state.topBar.appendChild(dots);
+  }
+
+  function ccsRenderNav(state) {
+    clear(state.nav);
+    var back = el('button', { class: 'cp-ccs-navbtn', type: 'button', text: '← Back' });
+    var atStart = state.view === 'slide' && state.idx === 0;
+    back.disabled = atStart;
+    back.addEventListener('click', function () {
+      if (state.view === 'summary') {
+        state.view = 'slide';
+        state.idx = state.posts.length - 1;
+      } else if (state.idx > 0) {
+        state.idx -= 1;
+      }
+      ccsRender(state);
+    });
+
+    var isLast = state.idx >= state.posts.length - 1;
+    var next = el('button', {
+      class: 'cp-ccs-navbtn cp-ccs-next', type: 'button',
+      text: state.view === 'summary' ? 'Summary' : (isLast ? 'Finish →' : 'Next →'),
+    });
+    var decided = state.decisions[state.idx] != null;
+    next.disabled = state.view === 'summary' || !decided;
+    if (!decided && state.view !== 'summary') {
+      next.title = 'Approve this post or request changes first';
+    }
+    next.addEventListener('click', function () {
+      if (state.view === 'summary') return;
+      if (isLast) state.view = 'summary';
+      else state.idx += 1;
+      ccsRender(state);
+    });
+
+    state.nav.appendChild(back);
+    state.nav.appendChild(next);
+  }
+
+  // The media items of one post across every slot, flattened for the carousel.
+  function ccsMediaOf(state, post) {
+    var items = [];
+    state.slots.forEach(function (s) {
+      ccPostMedia(post, s.slotKey).forEach(function (entry) {
+        items.push({ slot: s, entry: entry });
+      });
+    });
+    return items;
+  }
+
+  function ccsSlide(state, i) {
+    var post = state.posts[i];
+    var uid = ccUidOf(post, i);
+    var decision = state.decisions[i];
+    var slide = el('div', { class: 'cp-ccs-slide' });
+
+    // ── Media carousel ────────────────────────────────────────────
+    var items = ccsMediaOf(state, post);
+    var imageUrls = items.filter(function (it) {
+      return it.entry.kind === 'image' || looksLikeImage(it.entry.url);
+    }).map(function (it) { return assetUrl(it.entry.url); });
+
+    if (!items.length) {
+      slide.appendChild(el('div', { class: 'cp-ccs-empty', text: 'No artwork uploaded for this post yet.' }));
+    } else {
+      var media = el('div', { class: 'cp-ccs-media' });
+      var mediaDots = items.length > 1 ? el('div', { class: 'cp-ccs-medianav' }) : null;
+
+      items.forEach(function (it, mIdx) {
+        var url = assetUrl(it.entry.url || it.entry.href);
+        var name = it.entry.name || ('image ' + (mIdx + 1));
+        var marked = (state.marks[uid] || []).some(function (m) { return m.key === it.slot.slotKey + '::' + (it.entry.url || mIdx); });
+        var item = el('div', { class: 'cp-ccs-mediaitem' + (marked ? ' cp-ccs-marked' : '') });
+
+        if (it.entry.kind === 'image' || (it.entry.kind == null && looksLikeImage(it.entry.url))) {
+          var img = el('img', { class: 'cp-ccs-img', src: url, alt: name, loading: 'lazy' });
+          img.addEventListener('click', function () {
+            openImageLightbox(imageUrls, imageUrls.indexOf(url));
+          });
+          item.appendChild(img);
+        } else if (it.entry.kind === 'video' || looksLikeVideo(it.entry.url)) {
+          item.appendChild(el('video', { class: 'cp-ccs-video', src: url, controls: true, preload: 'metadata' }));
+        } else {
+          item.appendChild(el('a', { class: 'cp-cc-link', href: url, target: '_blank', rel: 'noopener', text: name }));
+        }
+
+        item.appendChild(el('span', { class: 'cp-ccs-slotchip', text: it.slot.label || it.slot.slotKey }));
+
+        var slotApproved = post.approvals && post.approvals[it.slot.slotKey] === true;
+        if (!state.readOnly && !slotApproved && decision !== 'approved') {
+          var markBtn = el('button', {
+            class: 'cp-ccs-markbtn', type: 'button',
+            text: marked ? 'Change requested — undo' : 'Request change on this image',
+          });
+          markBtn.addEventListener('click', function () {
+            var list = state.marks[uid] || (state.marks[uid] = []);
+            var key = it.slot.slotKey + '::' + (it.entry.url || mIdx);
+            var at = -1;
+            for (var j = 0; j < list.length; j++) { if (list[j].key === key) { at = j; break; } }
+            if (at === -1) list.push({ key: key, slotLabel: it.slot.label || it.slot.slotKey, name: name });
+            else {
+              list.splice(at, 1);
+              if (!list.length) delete state.marks[uid];
+            }
+            var keepScroll = media.scrollLeft;
+            ccsRender(state);
+            var m2 = state.stage.querySelector('.cp-ccs-media');
+            if (m2) m2.scrollLeft = keepScroll;
+          });
+          item.appendChild(markBtn);
+        }
+        media.appendChild(item);
+      });
+
+      if (mediaDots) {
+        items.forEach(function (_it, mIdx) {
+          mediaDots.appendChild(el('span', { class: 'cp-ccs-medianav-dot' + (mIdx === 0 ? ' active' : '') }));
+        });
+        media.addEventListener('scroll', function () {
+          var w = media.clientWidth || 1;
+          var active = Math.round(media.scrollLeft / w);
+          var ds = mediaDots.children;
+          for (var j = 0; j < ds.length; j++) {
+            ds[j].className = 'cp-ccs-medianav-dot' + (j === active ? ' active' : '');
           }
-          state.refreshFooter();
         });
-        item.appendChild(markBtn);
       }
-      cell.appendChild(item);
-    });
-    return cell;
-  }
 
-  function renderCcActionsCell(state, portalToken, deliverable, post, idx) {
-    var uid = ccUidOf(post, idx);
-    var cell = el('div', { class: 'cp-cc-actions' });
-    var withMedia = ccSlotsWithMedia(state.slots, post);
-    if (!withMedia.length) {
-      cell.appendChild(el('span', { class: 'cp-cc-empty', text: 'No media yet' }));
-      return cell;
+      slide.appendChild(media);
+      if (mediaDots) slide.appendChild(mediaDots);
     }
-    if (ccPostApproved(state.slots, post)) {
-      cell.appendChild(el('span', { class: 'cp-post-approved-tag', text: '✓ Approved' }));
-      return cell;
-    }
-    var approveBtn = el('button', { class: 'cp-btn cp-btn-approve', type: 'button', text: 'Approve' });
-    approveBtn.addEventListener('click', function () {
-      approveCcPost(portalToken, deliverable, post, idx, state.slots, approveBtn);
+
+    // ── Caption (social-post style, editable) ─────────────────────
+    var body = el('div', { class: 'cp-ccs-body' });
+    var saveflag = el('span', { class: 'cp-ccs-saveflag', text: state.captionEdits[uid] !== undefined ? 'Edited' : '' });
+    var captionLocked = state.readOnly || decision === 'approved';
+    body.appendChild(el('div', { class: 'cp-ccs-caphead' }, [
+      el('span', { text: captionLocked ? 'Caption' : 'Caption — tap to edit' }),
+      saveflag,
+    ]));
+
+    var editor = el('div', {
+      class: 'cp-editor cp-ccs-editor',
+      html: state.captionEdits[uid] !== undefined ? state.captionEdits[uid] : (post.captionHtml || ''),
     });
-    cell.appendChild(approveBtn);
-    if (!state.readOnly) {
-      var note = el('textarea', { class: 'cp-textarea cp-cc-note', placeholder: 'Describe the change you need…' });
-      note.hidden = true;
+    if (captionLocked) {
+      editor.setAttribute('contenteditable', 'false');
+    } else {
+      editor.setAttribute('contenteditable', 'true');
+      var toolbar = el('div', { class: 'cp-toolbar' });
+      [['bold', 'B'], ['italic', 'I'], ['underline', 'U'], ['insertUnorderedList', '•']].forEach(function (pair) {
+        var b = el('button', { type: 'button', html: pair[1] });
+        b.addEventListener('mousedown', function (e) { e.preventDefault(); });
+        b.addEventListener('click', function () { document.execCommand(pair[0], false, null); editor.focus(); });
+        toolbar.appendChild(b);
+      });
+      body.appendChild(toolbar);
+      var seed = post.captionHtml || '';
+      editor.addEventListener('input', function () {
+        if (editor.innerHTML !== seed) state.captionEdits[uid] = editor.innerHTML;
+        else delete state.captionEdits[uid];
+        saveflag.textContent = state.captionEdits[uid] !== undefined ? 'Edited' : '';
+        ccsSyncDirty(state);
+      });
+    }
+    body.appendChild(editor);
+
+    // Note for the marked artwork — appears once an image is marked.
+    if ((state.marks[uid] || []).length && !state.readOnly) {
+      var noteWrap = el('div', { class: 'cp-ccs-note-wrap' });
+      noteWrap.appendChild(el('div', { class: 'cp-ccs-caphead' }, [
+        el('span', { text: 'What should change on the marked artwork?' }),
+      ]));
+      var note = el('textarea', {
+        class: 'cp-textarea cp-ccs-note',
+        placeholder: 'Describe the change you need on the marked image(s)…',
+      });
+      note.value = state.notes[uid] || '';
       note.addEventListener('input', function () {
         if (note.value.trim()) state.notes[uid] = note.value;
         else delete state.notes[uid];
-        state.refreshFooter();
+        ccsSyncDirty(state);
       });
-      var noteBtn = el('button', { class: 'cp-btn cp-cc-notebtn', type: 'button', text: 'Add note' });
-      noteBtn.addEventListener('click', function () {
-        note.hidden = !note.hidden;
-        noteBtn.textContent = note.hidden ? 'Add note' : 'Hide note';
-        if (!note.hidden) note.focus();
-      });
-      cell.appendChild(noteBtn);
-      cell.appendChild(note);
+      noteWrap.appendChild(note);
+      body.appendChild(noteWrap);
     }
-    return cell;
+    slide.appendChild(body);
+
+    // ── Decision ──────────────────────────────────────────────────
+    var decide = el('div', { class: 'cp-ccs-decide' });
+    var warn = el('div', { class: 'cp-warn', hidden: true });
+
+    if (decision === 'skip') {
+      decide.appendChild(el('span', { class: 'cp-ccs-status', text: 'Nothing to approve yet — artwork still in production.' }));
+    } else if (decision === 'approved') {
+      decide.appendChild(el('span', { class: 'cp-ccs-status approved', text: '✓ Approved' }));
+    } else if (decision === 'changes') {
+      var st = el('span', { class: 'cp-ccs-status changes', text: 'Changes requested (queued)' });
+      var undo = el('button', { class: 'cp-ccs-undobtn', type: 'button', text: 'Change decision' });
+      undo.addEventListener('click', function () {
+        state.decisions[i] = null;
+        ccsRender(state);
+      });
+      decide.appendChild(st);
+      decide.appendChild(undo);
+    } else {
+      var approveBtn = el('button', { class: 'cp-btn cp-btn-approve', type: 'button', text: 'Approve this post' });
+      approveBtn.addEventListener('click', function () {
+        ccsApprovePost(state, i, approveBtn, warn);
+      });
+      decide.appendChild(approveBtn);
+
+      if (!state.readOnly) {
+        var changesBtn = el('button', { class: 'cp-btn cp-ccs-changesbtn', type: 'button', text: 'Request changes' });
+        changesBtn.addEventListener('click', function () {
+          var hasSignal = (state.marks[uid] || []).length ||
+            (state.notes[uid] || '').trim() ||
+            state.captionEdits[uid] !== undefined;
+          if (!hasSignal) {
+            warn.textContent = 'Mark an image ("Request change on this image"), add a note or edit the caption first.';
+            warn.hidden = false;
+            return;
+          }
+          state.decisions[i] = 'changes';
+          ccsAdvance(state);
+        });
+        decide.appendChild(changesBtn);
+      }
+    }
+    slide.appendChild(decide);
+    slide.appendChild(warn);
+    return slide;
   }
 
-  // One click approves every size slot of this post that has media. The new
-  // CRM honours `sizes:'all'`; an older CRM ignores it and approves only
-  // `size`, so we detect the shortfall from the returned metadata and sweep
-  // the remaining slots per-size (deploy-order tolerance).
-  function approveCcPost(portalToken, deliverable, post, idx, slots, btn) {
-    var withMedia = ccSlotsWithMedia(slots, post);
+  function ccsAdvance(state) {
+    var open = ccsFirstOpen(state);
+    if (open === -1) state.view = 'summary';
+    else { state.view = 'slide'; state.idx = open; }
+    ccsRender(state);
+  }
+
+  // Approve = every size slot of this post that has media, in one click. The
+  // new CRM takes `sizes:'all'`; an older CRM approves only `size`, so sweep
+  // whatever the response says is still unapproved (deploy-order tolerance).
+  function ccsApprovePost(state, i, btn, warn) {
+    var post = state.posts[i];
+    var withMedia = ccSlotsWithMedia(state.slots, post);
     if (!withMedia.length) return;
-    var token = currentRoute().token || portalToken;
     if (btn) { btn.disabled = true; btn.textContent = 'Approving…'; }
     api('POST', '/api/request-forms/public/portal/approve', {
-      deliverableId: deliverable.id,
+      deliverableId: state.d.id,
       postUid: post.postUid || undefined,
-      postIndex: idx,
+      postIndex: i,
       size: withMedia[0].slotKey,
       sizes: 'all',
-      portalToken: token,
+      portalToken: state.token,
     }).then(function (res) {
       if (!res.ok) throw res;
       var returnedMeta = res.data && res.data.metadata;
@@ -1189,8 +1329,8 @@
       var remaining = [];
       if (returnedMeta && Array.isArray(returnedMeta.posts)) {
         var rp = null;
-        for (var i = 0; i < returnedMeta.posts.length; i++) {
-          if (ccUidOf(returnedMeta.posts[i], i) === ccUidOf(post, idx)) { rp = returnedMeta.posts[i]; break; }
+        for (var j = 0; j < returnedMeta.posts.length; j++) {
+          if (ccUidOf(returnedMeta.posts[j], j) === ccUidOf(post, i)) { rp = returnedMeta.posts[j]; break; }
         }
         if (rp) {
           remaining = withMedia.filter(function (s) {
@@ -1202,27 +1342,82 @@
       remaining.forEach(function (s) {
         chain = chain.then(function () {
           return api('POST', '/api/request-forms/public/portal/approve', {
-            deliverableId: deliverable.id,
+            deliverableId: state.d.id,
             postUid: post.postUid || undefined,
-            postIndex: idx,
+            postIndex: i,
             size: s.slotKey,
-            portalToken: token,
+            portalToken: state.token,
           });
         });
       });
       return chain;
     }).then(function () {
-      loadApprovals(token);
+      var uid = ccUidOf(post, i);
+      post.approvals = post.approvals || {};
+      withMedia.forEach(function (s) { post.approvals[s.slotKey] = true; });
+      delete state.marks[uid];
+      delete state.notes[uid];
+      delete state.captionEdits[uid];
+      state.decisions[i] = 'approved';
+      ccsAdvance(state);
     }).catch(function (res) {
-      if (btn) { btn.disabled = false; btn.textContent = 'Approve'; }
-      alert((res && res.data && res.data.error) || 'Could not approve. Please try again.');
+      if (btn) { btn.disabled = false; btn.textContent = 'Approve this post'; }
+      if (warn) {
+        warn.textContent = (res && res.data && res.data.error) || 'Could not approve. Please try again.';
+        warn.hidden = false;
+      }
     });
   }
 
-  // ONE POST = ONE change round: aggregate every mark, note and caption edit
-  // into a single change-request body plus a captionEdits map keyed by post
-  // uid/index (the shape the CRM writes back into posts[].captionHtml).
-  function submitCcChanges(state, portalToken, deliverable, btn, warn) {
+  function ccsSummary(state) {
+    var box = el('div', { class: 'cp-ccs-slide cp-ccs-summary' });
+    box.appendChild(el('h3', { class: 'cp-ccs-sumtitle', text: 'Review summary' }));
+
+    var changed = [];
+    state.posts.forEach(function (p, i) {
+      var dec = state.decisions[i];
+      var label = 'Post ' + (i + 1) + (p.postDate ? ' — ' + formatDate(p.postDate) : '');
+      var badge;
+      if (dec === 'approved') badge = el('span', { class: 'cp-ccs-status approved', text: '✓ Approved' });
+      else if (dec === 'changes') { badge = el('span', { class: 'cp-ccs-status changes', text: 'Changes requested' }); changed.push(i); }
+      else if (dec === 'skip') badge = el('span', { class: 'cp-ccs-status', text: 'No artwork yet' });
+      else badge = el('span', { class: 'cp-ccs-status', text: 'Pending' });
+      box.appendChild(el('div', { class: 'cp-ccs-sumrow' }, [el('span', { text: label }), badge]));
+    });
+
+    var wrap = el('div', { class: 'cp-ccs-submitwrap' });
+    var warn = el('div', { class: 'cp-warn', hidden: true });
+
+    if (changed.length) {
+      var submitBtn = el('button', {
+        class: 'cp-btn cp-btn-primary', type: 'button',
+        text: 'Submit change requests (' + state.roundsLeft + ' left)',
+      });
+      submitBtn.disabled = state.readOnly;
+      if (state.readOnly) {
+        warn.textContent = 'No change rounds left — please approve the remaining posts instead.';
+        warn.hidden = false;
+      }
+      submitBtn.addEventListener('click', function () {
+        ccsSubmitChanges(state, submitBtn, warn);
+      });
+      wrap.appendChild(submitBtn);
+      wrap.appendChild(el('p', { class: 'cp-note', text: 'This sends all your queued changes as ONE change round.' }));
+    } else {
+      wrap.appendChild(el('div', { class: 'cp-ccs-alldone' }, [
+        el('div', { class: 'cp-tick', text: '✓' }),
+        el('p', { text: 'All posts reviewed — thank you! Our team takes it from here.' }),
+      ]));
+    }
+    wrap.appendChild(warn);
+    box.appendChild(wrap);
+    return box;
+  }
+
+  // ONE submit = ONE change round: every mark, note and caption edit across
+  // all posts goes out as a single change-request (captionEdits keyed by post
+  // uid/index — the shape the CRM writes back into posts[].captionHtml).
+  function ccsSubmitChanges(state, btn, warn) {
     warn.hidden = true;
     var lines = [];
     state.posts.forEach(function (p, idx) {
@@ -1236,38 +1431,37 @@
       if (state.captionEdits[uid] !== undefined) lines.push(label + ' — caption edited.');
     });
     if (!lines.length) {
-      warn.textContent = 'Mark artwork, add a note or edit a caption before submitting.';
+      warn.textContent = 'No changes queued — go back and mark an image or edit a caption.';
       warn.hidden = false;
       return;
     }
-    var token = currentRoute().token || portalToken;
     btn.disabled = true;
     btn.textContent = 'Sending…';
     api('POST', '/api/request-forms/public/portal/change-request', {
-      deliverableId: deliverable.id,
+      deliverableId: state.d.id,
       body: lines.join('\n'),
       captionEdits: state.captionEdits,
       screenshots: [],
-      portalToken: token,
+      portalToken: state.token,
     }).then(function (res) {
       if (res.ok) {
         if (state.card) state.card.removeAttribute('data-cc-dirty');
-        loadApprovals(token);
+        loadApprovals(state.token);
       } else if (res.status === 409) {
         state.roundsLeft = 0;
         state.readOnly = true;
-        btn.textContent = 'Submit changes (0 left)';
+        btn.textContent = 'Submit change requests (0 left)';
         warn.textContent = 'No change rounds left — please approve.';
         warn.hidden = false;
       } else {
         btn.disabled = false;
-        state.refreshFooter();
+        btn.textContent = 'Submit change requests (' + state.roundsLeft + ' left)';
         warn.textContent = (res.data && res.data.error) || 'Could not send. Please try again.';
         warn.hidden = false;
       }
     }).catch(function () {
       btn.disabled = false;
-      state.refreshFooter();
+      btn.textContent = 'Submit change requests (' + state.roundsLeft + ' left)';
       warn.textContent = 'Could not send. Please try again.';
       warn.hidden = false;
     });
