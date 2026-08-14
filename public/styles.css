@@ -1226,4 +1226,5 @@ body {
   .cp-ccs-undobtn { margin-left: 0; text-align: center; }
   .cp-ccs-navbtn { flex: 1 1 0; padding: 10px 12px; }
   .cp-ccs-markbtn { font-size: 11px; padding: 5px 10px; }
+  .cp-ccs-img { max-height: 480px; }
 }
