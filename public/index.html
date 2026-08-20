@@ -5,6 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ProAgri Client Portal</title>
   <link rel="stylesheet" href="/styles.css" />
+  <!-- Focus points approval page (/focus-points/:portalToken/:deliverableId). Its own
+       sheet so the shared portal styles stay untouched by a page only one deep link
+       reaches. -->
+  <link rel="stylesheet" href="/fp-approval.css" />
 </head>
 <body>
   <header class="cp-header">
@@ -42,6 +46,13 @@
 
   <!-- Schema-driven render engine — native cp- styling (no Tailwind). -->
   <script src="/form-render.js"></script>
+  <!-- fp-approval.js MUST load BEFORE app.js. app.js is one IIFE that calls route()
+       on its final line, so the focus points branch dispatches during that same
+       parse and window.CPFocusPoints has to already exist. Loading it after gives a
+       blank page on a cold open and a working one on every reload, which is the
+       worst kind of bug to chase. Neither file does anything on load beyond
+       defining its own functions. -->
+  <script src="/fp-approval.js"></script>
   <script src="/app.js"></script>
   <script src="https://agri360.proagrihub.com/feedback-widget.embed.js" data-app="client-portal" defer></script>
 </body>

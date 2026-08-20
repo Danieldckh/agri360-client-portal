@@ -1,0 +1,384 @@
+/* Agri360 Client Portal - Focus points approval page
+   ---------------------------------------------------
+   Styles for window.CPFocusPoints.render (public/fp-approval.js). Everything
+   here is namespaced .cp-fp*, so this file can be added to and removed from
+   index.html without touching a pixel of styles.css.
+
+   IT USES styles.css TOKENS AND NOTHING ELSE. Every colour, radius and shadow
+   comes from the :root vars at the top of styles.css. A page the client reaches
+   by a link from a WhatsApp message is the last place a second palette should
+   appear, and a hardcoded hex here is a colour that stops matching the day the
+   brand red moves.
+
+   MOBILE FIRST, AND THAT IS NOT A FIGURE OF SPEECH: the base rules below ARE the
+   390px layout. The only media query that adds anything is the one at 720px,
+   which widens the card into a row. Written the other way round, every phone
+   pays for desktop rules it then has to override.
+
+   THE BAR IS position: fixed, NOT sticky. Sticky bottom inside .cp-main sticks
+   to the bottom of the MAIN element, and .cp-main is a flex child that grows,
+   so on a short page the bar lands mid screen. Fixed to the viewport is what the
+   spec actually asks for: reachable from the first paint, not after a scroll.
+   .cp-fp-pad below the list buys back the height it covers. */
+
+.cp-fp {
+  /* One number, used by the bar height and by the scroll padding that clears it.
+     Two hand-tuned numbers drift and the last card ends up under the button. */
+  --cp-fp-bar-h: 112px;
+  display: block;
+}
+
+/* -- header ------------------------------------------------------- */
+.cp-fp-head { margin-bottom: 18px; }
+
+.cp-fp-client {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--cp-primary);
+  margin-bottom: 6px;
+}
+
+.cp-fp-title {
+  font-size: 21px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+  margin: 0;
+  color: var(--cp-text);
+}
+
+.cp-fp-sub {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--cp-text-muted);
+  margin-top: 3px;
+}
+
+.cp-fp-intro {
+  margin-top: 12px;
+  /* 60ch keeps the intro to about three lines at 390px. Past that a client stops
+     reading it, and it carries the one fact that stops them looking for a save
+     button. */
+  max-width: 60ch;
+}
+
+.cp-fp-empty { margin-top: 20px; }
+
+/* -- the stack ----------------------------------------------------- */
+.cp-fp-list { display: flex; flex-direction: column; gap: 12px; }
+
+.cp-fp-card {
+  background: var(--cp-surface);
+  border: 1px solid var(--cp-border);
+  border-radius: var(--cp-radius);
+  box-shadow: var(--cp-shadow);
+  padding: 14px;
+}
+
+.cp-fp-num {
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--cp-text-muted);
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+}
+
+/* -- description, read state -------------------------------------- */
+/* The text is the tap target, which is why there is no button beside it: a
+   button next to editable text reads as a second, different thing to press.
+   min-height keeps a one-word description at 44px so a thumb still lands on it. */
+.cp-fp-desc {
+  font-size: 16px;
+  line-height: 1.45;
+  color: var(--cp-text);
+  min-height: 44px;
+  padding: 6px 8px;
+  margin: 0 -8px;
+  border-radius: 8px;
+  cursor: text;
+  overflow-wrap: anywhere;
+}
+.cp-fp-desc[role='button']:hover { background: var(--cp-surface-2); }
+.cp-fp-desc:focus-visible {
+  outline: none;
+  background: var(--cp-surface-2);
+  box-shadow: 0 0 0 3px var(--cp-ring);
+}
+.cp-fp-desc-empty { color: var(--cp-text-muted); font-style: italic; }
+
+.cp-fp-hint {
+  font-size: 11px;
+  color: var(--cp-text-muted);
+  margin-top: 2px;
+  /* A muted hint under the text, never a button. It is the affordance that stands
+     in for a mounted editor, and it has to look like a caption, not a control. */
+}
+
+/* -- description, edit state -------------------------------------- */
+.cp-editor.cp-fp-editor {
+  font-size: 16px; /* under 16px iOS zooms the whole page on focus */
+  line-height: 1.45;
+  min-height: 88px;
+  margin-top: 2px;
+}
+
+.cp-fp-saveflag { min-height: 15px; }
+.cp-fp-dateflag { margin-top: 0; margin-left: auto; text-align: right; }
+
+/* -- date row ------------------------------------------------------ */
+.cp-fp-daterow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--cp-border);
+}
+
+.cp-fp-datelabel {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--cp-text-muted);
+}
+
+.cp-fp-date {
+  font: inherit;
+  font-size: 16px;
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 1px solid var(--cp-border-strong);
+  border-radius: 8px;
+  background: var(--cp-surface);
+  color: var(--cp-text);
+  /* Native date inputs on iOS ignore width and size themselves off the locale
+     format, so this is a floor rather than a fixed width. */
+  min-width: 150px;
+}
+.cp-fp-date:focus {
+  outline: none;
+  border-color: var(--cp-primary);
+  box-shadow: 0 0 0 3px var(--cp-ring);
+}
+
+.cp-fp-datestatic { font-size: 15px; color: var(--cp-text); }
+
+/* -- sticky bar ---------------------------------------------------- */
+.cp-fp-pad { height: var(--cp-fp-bar-h); }
+
+.cp-fp-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 20;
+  background: var(--cp-surface);
+  border-top: 1px solid var(--cp-border);
+  box-shadow: 0 -4px 20px -8px hsl(0 0% 0% / 0.18);
+  padding: 10px 20px;
+  /* Home-indicator inset on iOS. Without it the button's bottom third sits under
+     the system gesture bar, which is where a mis-tap becomes a swipe home. */
+  padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+}
+
+.cp-fp-barnote {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--cp-text-muted);
+  margin-bottom: 8px;
+  text-align: center;
+}
+
+.cp-btn.cp-fp-approve {
+  min-height: 48px;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.cp-warn.cp-fp-warn { margin-top: 8px; }
+
+.cp-fp-bar-done {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+.cp-fp-bar-done .cp-fp-barnote { margin-bottom: 0; }
+.cp-fp-donetick {
+  font-size: 20px;
+  line-height: 1;
+  color: var(--cp-success);
+}
+
+/* -- confirm sheet -------------------------------------------------- */
+/* Bottom anchored, capped at 80vh with its own scroll. The cap matters on a
+   small phone in landscape, where an uncapped sheet covers the page it is
+   asking a question about. */
+.cp-fp-sheet-host {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+}
+
+.cp-fp-sheet-backdrop {
+  position: absolute;
+  inset: 0;
+  background: hsl(0 0% 0% / 0.45);
+  animation: cp-fp-fade 140ms ease-out;
+}
+
+.cp-fp-sheet {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  max-height: 80vh;
+  overflow-y: auto;
+  background: var(--cp-surface);
+  border-radius: 16px 16px 0 0;
+  padding: 6px 20px calc(18px + env(safe-area-inset-bottom, 0px));
+  box-shadow: 0 -8px 40px -10px hsl(0 0% 0% / 0.35);
+  animation: cp-fp-rise 180ms cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+
+/* The grab handle is a 44px dismiss target in its own right, not decoration.
+   The visible pill is drawn with ::before so the tappable area can be bigger
+   than the thing the client sees. */
+.cp-fp-sheet-grab {
+  height: 44px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.cp-fp-sheet-grab::before {
+  content: '';
+  display: block;
+  width: 44px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--cp-border-strong);
+}
+
+.cp-fp-sheet-x {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  width: 44px;
+  height: 44px;
+  border: 0;
+  background: transparent;
+  color: var(--cp-text-muted);
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 8px;
+}
+.cp-fp-sheet-x:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--cp-ring); }
+
+.cp-fp-sheet-body { padding: 2px 0 4px; }
+
+.cp-fp-sheet-title {
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  margin: 0 0 8px;
+  color: var(--cp-text);
+  padding-right: 44px; /* clear of the × */
+}
+
+.cp-fp-sheet-line {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--cp-text-muted);
+  margin: 0 0 8px;
+}
+
+/* Stacked, so the confirm is the bottom button and the cancel is the one under
+   the thumb that was already moving. 12px apart, well over the 8px the touch
+   rules ask for between a destructive control and its neighbour. */
+.cp-fp-sheet-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 14px;
+}
+.cp-fp-sheet-actions .cp-btn {
+  width: 100%;
+  min-height: 48px;
+  font-size: 15px;
+  font-weight: 700;
+  text-align: center;
+}
+
+@keyframes cp-fp-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes cp-fp-rise { from { transform: translateY(100%); } to { transform: translateY(0); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .cp-fp-sheet, .cp-fp-sheet-backdrop { animation: none; }
+}
+
+/* -- wide variant --------------------------------------------------- */
+/* The desktop table from spec section 5, reached by widening the stack rather
+   than by swapping layouts: number and description keep leading, the date moves
+   onto the same line instead of below it. Nothing here changes the DOM order, so
+   the tab order and the screen-reader order are identical at every width. */
+@media (min-width: 720px) {
+  .cp-fp { --cp-fp-bar-h: 96px; }
+
+  .cp-fp-title { font-size: 24px; }
+
+  .cp-fp-card {
+    display: grid;
+    grid-template-columns: 40px minmax(0, 1fr) 210px;
+    align-items: start;
+    gap: 4px 16px;
+    padding: 16px 18px;
+  }
+  .cp-fp-num {
+    grid-column: 1;
+    font-size: 15px;
+    color: var(--cp-text);
+    padding-top: 6px;
+    margin-bottom: 0;
+  }
+  .cp-fp-descwrap { grid-column: 2; min-width: 0; }
+  .cp-fp-daterow {
+    grid-column: 3;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    margin-top: 0;
+    padding-top: 0;
+    border-top: 0;
+  }
+  .cp-fp-date { width: 100%; }
+  .cp-fp-dateflag { margin-left: 0; text-align: left; }
+
+  .cp-fp-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+    padding: 14px 20px;
+  }
+  .cp-fp-barnote { margin-bottom: 0; text-align: left; }
+  .cp-btn.cp-fp-approve { width: auto; min-width: 240px; }
+  /* The warn line is a flex child on wide screens, so it needs its own row
+     rather than sitting between the note and the button. */
+  .cp-warn.cp-fp-warn { flex-basis: 100%; margin-top: 0; }
+
+  .cp-fp-sheet {
+    left: 50%;
+    right: auto;
+    transform: translateX(-50%);
+    width: 480px;
+    border-radius: 16px 16px 0 0;
+  }
+  @keyframes cp-fp-rise { from { transform: translateX(-50%) translateY(100%); } to { transform: translateX(-50%) translateY(0); } }
+  .cp-fp-sheet-actions { flex-direction: row; justify-content: flex-end; }
+  .cp-fp-sheet-actions .cp-btn { width: auto; min-width: 150px; }
+}

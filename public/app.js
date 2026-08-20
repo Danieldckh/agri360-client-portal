@@ -581,6 +581,85 @@
     });
   }
 
+  // ════════════════════════════════════════════════════════════════
+  // FLOW 2b — FOCUS POINTS   /focus-points/:portalToken/:deliverableId
+  // ════════════════════════════════════════════════════════════════
+  // The deep link we email the client when a month's focus points go out. One
+  // calendar, its plan and one Approve button. The pixels live in
+  // public/fp-approval.js because this file is a single IIFE and nothing inside
+  // it is reachable from outside; this function owns the fetch, the router entry
+  // and live sync, and hands that file a helper bag.
+  function loadFocusPoints(portalToken, deliverableId, silent) {
+    if (!silent) render(el('div', { class: 'cp-loading', text: 'Loading focus points…' }));
+    if (!window.CPFocusPoints || typeof window.CPFocusPoints.render !== 'function') {
+      // The script tag went missing (see index.html: fp-approval.js loads BEFORE
+      // app.js). Say so rather than leave the client on the loading state.
+      if (!silent) render(errorState('This page could not be opened. Please contact ProAgri.'));
+      return;
+    }
+    api('GET', '/api/request-forms/public/portal/' + encodeURIComponent(portalToken)
+        + '/focus-points/' + encodeURIComponent(deliverableId)).then(function (r) {
+      if (!r.ok || !r.data) {
+        if (!silent) render(errorState('These focus points could not be found. The link may be out of date.'));
+        return;
+      }
+      var node = window.CPFocusPoints.render({
+        el: el,
+        api: api,
+        portalToken: portalToken,
+        deliverableId: deliverableId,
+        formatDate: formatDate,
+        formatMonth: formatMonth,
+        metaOf: fpMetaOf,
+        tagItem: tagItem,
+        // afterRenderRestore is deliberately NOT passed. The file calls it at the
+        // tail of its own mount, which is before the node is in the document, and
+        // the restore scrolls the window. It is called below instead, once the
+        // node is actually on the page.
+        // onApproved is deliberately NOT passed either. fp-approval rebuilds
+        // itself into the receipt in place, and the sync tick that follows the
+        // approve write re-renders this view from the server anyway. A reload
+        // here would race that rebuild for no gain.
+      }, r.data);
+      render(node);
+      startSync('focus-points', portalToken, deliverableId, function (t, sil) {
+        loadFocusPoints(t, deliverableId, sil);
+      });
+      afterRenderRestore();
+    }).catch(function () {
+      if (!silent) render(errorState('Could not load your focus points. Please try again.'));
+    });
+  }
+
+  // The focus points handler returns a FLAT row (focusPoints, portalState and the
+  // approval stamps at the top level), not a deliverable carrying a metadata
+  // blob, so the plain metaOf() below would hand fp-approval an empty object and
+  // the page would render "no focus points yet" on a month that has ten. This
+  // rebuilds the metadata shape that file reads, from the fields the handler
+  // actually sends.
+  //
+  // The one judgement call: `editable` is the handler's own answer to "are these
+  // still open", and fp-approval derives the same thing from status/portalState.
+  // Those disagree on a legacy row whose status is still a pre-strip spelling, so
+  // the handler's answer wins and is expressed as the portalState token fp-approval
+  // tests for. Approved is settled first, because a receipt must never reopen.
+  function fpMetaOf(data) {
+    var meta = metaOf(data);
+    var out = {};
+    Object.keys(meta).forEach(function (k) { out[k] = meta[k]; });
+    if (!data || typeof data !== 'object') return out;
+    if (Array.isArray(data.focusPoints)) out.focusPoints = data.focusPoints;
+    if (data.portalState) out.portalState = data.portalState;
+    if (data.focusPointsReceivedAt) out.focusPointsReceivedAt = data.focusPointsReceivedAt;
+    if (data.focusPointsApprovedAt) out.focusPointsApprovedAt = data.focusPointsApprovedAt;
+    if (data.approved === true) {
+      if (!out.focusPointsReceivedAt && !out.focusPointsApprovedAt) out.portalState = 'focus_points_approved';
+    } else if (data.editable === true) {
+      out.portalState = 'focus_points_sent';
+    }
+    return out;
+  }
+
   function extractDeliverables(data) {
     if (Array.isArray(data)) return data;
     if (data && Array.isArray(data.deliverables)) return data.deliverables;
@@ -715,9 +794,21 @@
       // materials stage. The generic per-post path below reads a retired post
       // shape and stays only as a fallback for unknown types.
       if (d.type === 'sm-content-calendar') {
-        var isFocusPoints = d.status === 'materials_requested' || d.status === 'focus_points_sent';
+        // portalState is read alongside the status because the two do not always
+        // agree: a legacy row can sit at a pre-strip status while metadata carries
+        // the focus-points state, which is how the approvals query finds it in the
+        // first place. Either signal picks the focus-points card, and either
+        // spelling of approved picks it read only, so a client reopening the link
+        // lands on a receipt rather than on the posts slider for a month whose
+        // artwork does not exist yet.
+        var ccState = metaOf(d).portalState || metaOf(d).portal_state || '';
+        var ccApproved = d.status === 'focus_points_approved' || ccState === 'focus_points_approved';
+        var isFocusPoints = ccApproved
+          || d.status === 'materials_requested'
+          || d.status === 'focus_points_sent'
+          || ccState === 'focus_points_sent';
         wrap.appendChild(tagItem(isFocusPoints
-          ? renderCcFocusPointsCard(portalToken, d)
+          ? renderCcFocusPointsCard(portalToken, d, ccApproved)
           : renderContentCalendarCard(portalToken, d), d));
         return;
       }
@@ -918,6 +1009,36 @@
     return (post && post.postUid) ? String(post.postUid) : String(idx);
   }
 
+  // Strict calendar test, the SAME rule the CRM validates dateEdits with
+  // (api/lib/focus-points.js isIsoDate, re-run at the top of the change-request
+  // handler before it charges the client a round). Borrowed from fp-approval.js
+  // when that file is on the page so there is one implementation to keep honest,
+  // with a local copy behind it so the slider still guards if that script tag is
+  // ever dropped. A regex on its own accepts 2026-02-30, and a native date input
+  // hands back partial values while the client is still typing into it.
+  function ccIsoDate(value) {
+    if (window.CPFocusPoints && typeof window.CPFocusPoints.isIsoDate === 'function') {
+      return window.CPFocusPoints.isIsoDate(value);
+    }
+    if (typeof value !== 'string') return false;
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (!m) return false;
+    var y = Number(m[1]), mo = Number(m[2]), dd = Number(m[3]);
+    if (mo < 1 || mo > 12 || dd < 1 || dd > 31) return false;
+    var probe = new Date(Date.UTC(y, mo - 1, dd));
+    return probe.getUTCFullYear() === y && probe.getUTCMonth() === mo - 1 && probe.getUTCDate() === dd;
+  }
+
+  // What <input type="date"> can actually hold, from whatever postDate holds.
+  // Legacy rows stored an ISO datetime, and feeding that to the input blanks it,
+  // which would make the seed comparison call every post a change. Anything that
+  // does not survive the strict test becomes '' (an undated post), never junk.
+  function ccDateOnly(v) {
+    if (!v) return '';
+    var m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v));
+    return m && ccIsoDate(m[1]) ? m[1] : '';
+  }
+
   function ccSlotsWithMedia(slots, post) {
     return slots.filter(function (s) { return ccPostMedia(post, s.slotKey).length > 0; });
   }
@@ -947,6 +1068,10 @@
       posts: posts,
       slots: slots,
       captionEdits: {},
+      // Client-changed post dates, keyed EXACTLY like captionEdits (post uid when
+      // the CRM has stamped one, positional index otherwise) so the two maps
+      // resolve to the same posts in the one submit that carries both.
+      dateEdits: {},
       marks: {},
       notes: {},
       decisions: [],
@@ -1009,7 +1134,8 @@
   }
 
   function ccsPendingCount(state) {
-    var count = Object.keys(state.captionEdits).length + Object.keys(state.notes).length;
+    var count = Object.keys(state.captionEdits).length + Object.keys(state.notes).length
+      + Object.keys(state.dateEdits).length;
     Object.keys(state.marks).forEach(function (k) { count += state.marks[k].length; });
     return count;
   }
@@ -1196,10 +1322,62 @@
       if (mediaDots) slide.appendChild(mediaDots);
     }
 
-    // ── Caption (social-post style, editable) ─────────────────────
     var body = el('div', { class: 'cp-ccs-body' });
-    var saveflag = el('span', { class: 'cp-ccs-saveflag', text: state.captionEdits[uid] !== undefined ? 'Edited' : '' });
     var captionLocked = state.readOnly || decision === 'approved';
+
+    // ── Post date (client editable, rides the change round) ───────
+    // The date is NOT saved on its own. It queues in state.dateEdits and goes out
+    // with the batch, because moving a post is a change request: it costs one of
+    // the three rounds and it has to reach Design with the rest of the round
+    // rather than mutating the month behind their back.
+    //
+    // Native <input type="date"> on purpose. This is opened from a WhatsApp link
+    // on a client's phone, and a hand-rolled calendar popup is the one thing on
+    // the page we cannot test on every device they own.
+    var seedDate = ccDateOnly(post.postDate);
+    var dateFlag = el('span', { class: 'cp-ccs-saveflag', text: state.dateEdits[uid] !== undefined ? 'Changed' : '' });
+    var shownDate = state.dateEdits[uid] !== undefined ? state.dateEdits[uid] : seedDate;
+    body.appendChild(el('div', { class: 'cp-ccs-caphead' }, [
+      el('span', { text: captionLocked ? 'Post date' : 'Post date, tap to change' }),
+      dateFlag,
+    ]));
+    if (captionLocked) {
+      body.appendChild(el('div', { class: 'cp-ccs-datestatic', text: shownDate ? formatDate(shownDate) : 'No date set' }));
+    } else {
+      var dateInput = el('input', { class: 'cp-input cp-ccs-dateinput', type: 'date', value: shownDate });
+      var dateWarn = el('div', { class: 'cp-warn cp-ccs-datewarn', hidden: true });
+      dateInput.addEventListener('change', function () {
+        var v = String(dateInput.value || '').trim();
+        if (!v) {
+          // The CRM answers an empty date with 400 "A post needs a date.", and it
+          // is right to: an undated post cannot be scheduled and the calendar
+          // would silently lose a slot. Refuse it here so the client is told now
+          // instead of after the submit has already been queued.
+          dateInput.value = shownDate;
+          delete state.dateEdits[uid];
+          dateFlag.textContent = '';
+          dateWarn.textContent = 'A post needs a date, the old one is back.';
+          dateWarn.hidden = false;
+          ccsSyncDirty(state);
+          return;
+        }
+        if (!ccIsoDate(v)) {
+          dateWarn.textContent = 'Please pick a real date.';
+          dateWarn.hidden = false;
+          return;
+        }
+        dateWarn.hidden = true;
+        if (v === seedDate) delete state.dateEdits[uid];
+        else state.dateEdits[uid] = v;
+        dateFlag.textContent = state.dateEdits[uid] !== undefined ? 'Changed' : '';
+        ccsSyncDirty(state);
+      });
+      body.appendChild(dateInput);
+      body.appendChild(dateWarn);
+    }
+
+    // ── Caption (social-post style, editable) ─────────────────────
+    var saveflag = el('span', { class: 'cp-ccs-saveflag', text: state.captionEdits[uid] !== undefined ? 'Edited' : '' });
     body.appendChild(el('div', { class: 'cp-ccs-caphead' }, [
       el('span', { text: captionLocked ? 'Caption' : 'Caption — tap to edit' }),
       saveflag,
@@ -1279,11 +1457,16 @@
       if (!state.readOnly) {
         var changesBtn = el('button', { class: 'cp-btn cp-ccs-changesbtn', type: 'button', text: 'Request changes' });
         changesBtn.addEventListener('click', function () {
+          // A changed date counts as signal. Without this clause a date-only
+          // round is refused here, and then refused a second time by the "No
+          // changes queued" guard on submit, so the client can move a post and
+          // have no way at all to send it.
           var hasSignal = (state.marks[uid] || []).length ||
             (state.notes[uid] || '').trim() ||
-            state.captionEdits[uid] !== undefined;
+            state.captionEdits[uid] !== undefined ||
+            state.dateEdits[uid] !== undefined;
           if (!hasSignal) {
-            warn.textContent = 'Mark an image ("Request change on this image"), add a note or edit the caption first.';
+            warn.textContent = 'Mark an image ("Request change on this image"), add a note, edit the caption or change the date first.';
             warn.hidden = false;
             return;
           }
@@ -1358,6 +1541,7 @@
       delete state.marks[uid];
       delete state.notes[uid];
       delete state.captionEdits[uid];
+      delete state.dateEdits[uid];
       state.decisions[i] = 'approved';
       ccsAdvance(state);
     }).catch(function (res) {
@@ -1414,9 +1598,11 @@
     return box;
   }
 
-  // ONE submit = ONE change round: every mark, note and caption edit across
-  // all posts goes out as a single change-request (captionEdits keyed by post
-  // uid/index — the shape the CRM writes back into posts[].captionHtml).
+  // ONE submit = ONE change round: every mark, note, caption edit and date change
+  // across all posts goes out as a single change-request. captionEdits and
+  // dateEdits share one key contract (post uid/index) and the CRM resolves both
+  // the same way, index first then uid, into posts[].captionHtml and
+  // posts[].postDate.
   function ccsSubmitChanges(state, btn, warn) {
     warn.hidden = true;
     var lines = [];
@@ -1429,9 +1615,14 @@
       var note = (state.notes[uid] || '').trim();
       if (note) lines.push(label + ' — note: ' + note);
       if (state.captionEdits[uid] !== undefined) lines.push(label + ' — caption edited.');
+      // Its own line, so the free-text body records a date move in words as well
+      // as in data, and so a date-only round is never an empty body.
+      if (state.dateEdits[uid] !== undefined) {
+        lines.push(label + ', date changed to ' + formatDate(state.dateEdits[uid]) + '.');
+      }
     });
     if (!lines.length) {
-      warn.textContent = 'No changes queued — go back and mark an image or edit a caption.';
+      warn.textContent = 'No changes queued, go back and mark an image, edit a caption or change a date.';
       warn.hidden = false;
       return;
     }
@@ -1441,6 +1632,10 @@
       deliverableId: state.d.id,
       body: lines.join('\n'),
       captionEdits: state.captionEdits,
+      // Sent alongside captionEdits in the same POST, same key contract. An older
+      // CRM ignores the key entirely, which drops the date change silently, which
+      // is why the server side of this ships first.
+      dateEdits: state.dateEdits,
       screenshots: [],
       portalToken: state.token,
     }).then(function (res) {
@@ -1472,7 +1667,12 @@
   // Edits save per row on blur via the CRM's focus-points/description endpoint
   // (dates are locked server-side); one Approve advances the whole calendar to
   // materials_received. No change-round cap at this stage.
-  function renderCcFocusPointsCard(portalToken, d) {
+  //
+  // readOnly renders the same table as a receipt: the client has already approved,
+  // and the row stays on their approvals list so the link they were sent keeps
+  // resolving. An editable card there would offer a save the CRM refuses with a
+  // 409, which reads to the client as "my approval was lost".
+  function renderCcFocusPointsCard(portalToken, d, readOnly) {
     var posts = postsOf(d);
     var token = currentRoute().token || portalToken;
 
@@ -1481,9 +1681,11 @@
         el('h2', { class: 'cp-card-title', text: d.title || d.name || 'Content Calendar' }),
         el('div', { class: 'cp-wd-round', text: 'Focus points approval' }),
       ]),
-      el('span', { class: 'cp-badge cp-badge-action', text: 'Approval required' }),
+      readOnly
+        ? el('span', { class: 'cp-badge cp-badge-approved', text: 'Approved' })
+        : el('span', { class: 'cp-badge cp-badge-action', text: 'Approval required' }),
     ]);
-    var card = el('div', { class: 'cp-card cp-card-action cp-cc-card' }, [head]);
+    var card = el('div', { class: 'cp-card cp-cc-card ' + (readOnly ? 'cp-card-approved' : 'cp-card-action') }, [head]);
 
     if (!posts.length) {
       card.appendChild(el('p', { class: 'cp-note', text: 'No focus points to review for this calendar yet.' }));
@@ -1492,7 +1694,9 @@
 
     card.appendChild(el('p', {
       class: 'cp-note',
-      text: 'These are the planned focus points for each post. Edit the text directly if you want something different — changes save automatically — then approve to move production ahead.',
+      text: readOnly
+        ? 'You approved these focus points. Our team is working on the artwork now.'
+        : 'These are the planned focus points for each post. Edit the text directly if you want something different — changes save automatically — then approve to move production ahead.',
     }));
 
     var headRow = el('tr', {}, [
@@ -1506,10 +1710,14 @@
       tr.appendChild(el('td', { 'data-label': '#', class: 'cp-cc-num', text: String(idx + 1) }));
       tr.appendChild(el('td', { 'data-label': 'Post date', text: post.postDate ? formatDate(post.postDate) : '—' }));
       var td = el('td', { 'data-label': 'Focus points', class: 'cp-cc-td-caption' });
-      var editor = el('div', { class: 'cp-editor cp-cc-editor', contenteditable: 'true', html: post.captionHtml || '' });
+      var editor = el('div', {
+        class: 'cp-editor cp-cc-editor',
+        contenteditable: readOnly ? 'false' : 'true',
+        html: post.captionHtml || '',
+      });
       var indicator = el('span', { class: 'cp-cc-saveflag', text: '' });
       var seed = editor.innerHTML;
-      editor.addEventListener('blur', function () {
+      if (!readOnly) editor.addEventListener('blur', function () {
         var html = editor.innerHTML;
         if (html === seed) return;
         indicator.textContent = 'Saving…';
@@ -1540,6 +1748,8 @@
 
     var table = el('table', { class: 'cp-cc-table cp-cc-fp-table' }, [el('thead', {}, [headRow]), tbody]);
     card.appendChild(el('div', { class: 'cp-cc-tablewrap' }, [table]));
+
+    if (readOnly) return card;
 
     var warn = el('div', { class: 'cp-warn', hidden: true });
     var approveBtn = el('button', { class: 'cp-btn cp-btn-approve', type: 'button', text: 'Approve focus points' });
@@ -3496,6 +3706,21 @@
       return { view: 'preview', token: null, itemId: decodeURIComponent(pv[1]) };
     }
 
+    // /focus-points/:portalToken/:deliverableId — the client's month plan behind
+    // the link we email them. Matched here, ABOVE the (video-forms|form|approvals|
+    // dashboard) alternation, for the same reason the preview branch is: the
+    // alternation is a two-segment pattern and a third segment would be dropped
+    // silently rather than 404, landing the client on somebody's approvals list.
+    // Both segments are required — a tokenless /focus-points/:id cannot be served
+    // because the CRM re-scopes the deliverable to the token's client (IDOR gate).
+    var fp = p.match(/^\/focus-points\/([^\/]+)\/([^\/]+)/);
+    if (!fp && window.location.hash) {
+      fp = window.location.hash.replace(/^#/, '').match(/^\/?focus-points\/([^\/]+)\/([^\/]+)/);
+    }
+    if (fp) {
+      return { view: 'focus-points', token: decodeURIComponent(fp[1]), itemId: decodeURIComponent(fp[2]) };
+    }
+
     // 'video-forms' is listed FIRST so the alternation can never be shadowed by
     // a shorter prefix as more views are added (the pattern is anchored, so
     // '/video-forms/x' cannot match the 'form' branch today either).
@@ -3512,6 +3737,7 @@
     var r = currentRoute();
     if (r.view === 'video-request') return loadVideoRequest();
     if (r.view === 'preview' && r.itemId) return loadPreview(r.token, r.itemId);
+    if (r.view === 'focus-points' && r.token && r.itemId) return loadFocusPoints(r.token, r.itemId);
     if (r.view === 'form' && r.token) return loadForm(r.token);
     if (r.view === 'approvals' && r.token) return loadApprovals(r.token);
     if (r.view === 'dashboard' && r.token) return loadDashboard(r.token);
