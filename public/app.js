@@ -8,6 +8,8 @@
  *   2) /approvals/:portalToken   — approve / request changes on CC deliverables.
  *   3) /dashboard/:portalToken   — content overview + previous approvals.
  *   4) /video-forms/:portalToken — the client's video request forms, by month.
+ *   5) /editor                  — staff branding editor. Token lives in the
+ *                                 hash: #<portal_token>&k=<jwt>.
  *
  * The :portalToken is an opaque, unguessable string (clients.portal_token).
  * It is passed straight through to the CRM, which resolves it to a client —
@@ -60,8 +62,13 @@
   }
 
   // ── API helper (same-origin proxy) ───────────────────────────────
-  function api(method, pathName, body) {
+  function api(method, pathName, body, extraHeaders) {
     var init = { method: method, headers: { 'Accept': 'application/json' } };
+    if (extraHeaders) {
+      Object.keys(extraHeaders).forEach(function (k) {
+        if (extraHeaders[k] != null) init.headers[k] = extraHeaders[k];
+      });
+    }
     if (body !== undefined) {
       if (typeof FormData !== 'undefined' && body instanceof FormData) {
         // Let the browser set Content-Type (incl. the multipart boundary).
@@ -581,6 +588,90 @@
     });
   }
 
+  // ════════════════════════════════════════════════════════════════
+  // FLOW 2b — FOCUS POINTS   /focus-points/:portalToken/:deliverableId
+  // ════════════════════════════════════════════════════════════════
+  // The deep link we email the client when a month's focus points go out. One
+  // calendar, its plan and one Approve button. The pixels live in
+  // public/fp-approval.js because this file is a single IIFE and nothing inside
+  // it is reachable from outside; this function owns the fetch, the router entry
+  // and live sync, and hands that file a helper bag.
+  function loadFocusPoints(portalToken, deliverableId, silent) {
+    if (!silent) render(el('div', { class: 'cp-loading', text: 'Loading focus points…' }));
+    if (!window.CPFocusPoints || typeof window.CPFocusPoints.render !== 'function') {
+      // The script tag went missing (see index.html: fp-approval.js loads BEFORE
+      // app.js). Say so rather than leave the client on the loading state.
+      if (!silent) render(errorState('This page could not be opened. Please contact ProAgri.'));
+      return;
+    }
+    api('GET', '/api/request-forms/public/portal/' + encodeURIComponent(portalToken)
+        + '/focus-points/' + encodeURIComponent(deliverableId)).then(function (r) {
+      if (!r.ok || !r.data) {
+        if (!silent) render(errorState('These focus points could not be found. The link may be out of date.'));
+        return;
+      }
+      var node = window.CPFocusPoints.render({
+        el: el,
+        api: api,
+        portalToken: portalToken,
+        deliverableId: deliverableId,
+        formatDate: formatDate,
+        // formatMonth is deliberately NOT passed. The shared one abbreviates
+        // ("Aug 2026") because the video-forms list stacks a month heading per
+        // row and needs the width back. This page names the month twice, in the
+        // title and in the sticky bar's "3 posts planned for ...", where the
+        // client is being told what a single irreversible button covers, so it
+        // takes fp-approval's own long-month fallback ("August 2026").
+        metaOf: fpMetaOf,
+        tagItem: tagItem,
+        // afterRenderRestore is deliberately NOT passed. The file calls it at the
+        // tail of its own mount, which is before the node is in the document, and
+        // the restore scrolls the window. It is called below instead, once the
+        // node is actually on the page.
+        // onApproved is deliberately NOT passed either. fp-approval rebuilds
+        // itself into the receipt in place, and the sync tick that follows the
+        // approve write re-renders this view from the server anyway. A reload
+        // here would race that rebuild for no gain.
+      }, r.data);
+      render(node);
+      startSync('focus-points', portalToken, deliverableId, function (t, sil) {
+        loadFocusPoints(t, deliverableId, sil);
+      });
+      afterRenderRestore();
+    }).catch(function () {
+      if (!silent) render(errorState('Could not load your focus points. Please try again.'));
+    });
+  }
+
+  // The focus points handler returns a FLAT row (focusPoints, portalState and the
+  // approval stamps at the top level), not a deliverable carrying a metadata
+  // blob, so the plain metaOf() below would hand fp-approval an empty object and
+  // the page would render "no focus points yet" on a month that has ten. This
+  // rebuilds the metadata shape that file reads, from the fields the handler
+  // actually sends.
+  //
+  // The one judgement call: `editable` is the handler's own answer to "are these
+  // still open", and fp-approval derives the same thing from status/portalState.
+  // Those disagree on a legacy row whose status is still a pre-strip spelling, so
+  // the handler's answer wins and is expressed as the portalState token fp-approval
+  // tests for. Approved is settled first, because a receipt must never reopen.
+  function fpMetaOf(data) {
+    var meta = metaOf(data);
+    var out = {};
+    Object.keys(meta).forEach(function (k) { out[k] = meta[k]; });
+    if (!data || typeof data !== 'object') return out;
+    if (Array.isArray(data.focusPoints)) out.focusPoints = data.focusPoints;
+    if (data.portalState) out.portalState = data.portalState;
+    if (data.focusPointsReceivedAt) out.focusPointsReceivedAt = data.focusPointsReceivedAt;
+    if (data.focusPointsApprovedAt) out.focusPointsApprovedAt = data.focusPointsApprovedAt;
+    if (data.approved === true) {
+      if (!out.focusPointsReceivedAt && !out.focusPointsApprovedAt) out.portalState = 'focus_points_approved';
+    } else if (data.editable === true) {
+      out.portalState = 'focus_points_sent';
+    }
+    return out;
+  }
+
   function extractDeliverables(data) {
     if (Array.isArray(data)) return data;
     if (data && Array.isArray(data.deliverables)) return data.deliverables;
@@ -715,9 +806,21 @@
       // materials stage. The generic per-post path below reads a retired post
       // shape and stays only as a fallback for unknown types.
       if (d.type === 'sm-content-calendar') {
-        var isFocusPoints = d.status === 'materials_requested' || d.status === 'focus_points_sent';
+        // portalState is read alongside the status because the two do not always
+        // agree: a legacy row can sit at a pre-strip status while metadata carries
+        // the focus-points state, which is how the approvals query finds it in the
+        // first place. Either signal picks the focus-points card, and either
+        // spelling of approved picks it read only, so a client reopening the link
+        // lands on a receipt rather than on the posts slider for a month whose
+        // artwork does not exist yet.
+        var ccState = metaOf(d).portalState || metaOf(d).portal_state || '';
+        var ccApproved = d.status === 'focus_points_approved' || ccState === 'focus_points_approved';
+        var isFocusPoints = ccApproved
+          || d.status === 'materials_requested'
+          || d.status === 'focus_points_sent'
+          || ccState === 'focus_points_sent';
         wrap.appendChild(tagItem(isFocusPoints
-          ? renderCcFocusPointsCard(portalToken, d)
+          ? renderCcFocusPointsCard(portalToken, d, ccApproved)
           : renderContentCalendarCard(portalToken, d), d));
         return;
       }
@@ -842,6 +945,14 @@
   };
   var CC_SLOT_LABELS = { facebook: 'Landscape', instagram: 'Square', stories: 'Vertical (Story)' };
   var CC_MAX_ROUNDS = 3;
+  // The one sentence a client who has spent all three rounds is given, defined
+  // ONCE. It used to exist in two different wordings (the summary slide said one
+  // thing, the 409 handler said a shorter one), so a client who hit the cap on
+  // their fourth submit read different words than a client who arrived already
+  // capped. It is also the only thing on the page telling them what to do
+  // instead, which is why it now renders whenever the card is read-only rather
+  // than only beside a change list they can no longer build.
+  var CC_NO_ROUNDS_MSG = 'No change rounds left, please approve the remaining posts instead.';
 
   function ccCanonicalSlot(v) {
     if (v == null) return '';
@@ -918,6 +1029,36 @@
     return (post && post.postUid) ? String(post.postUid) : String(idx);
   }
 
+  // Strict calendar test, the SAME rule the CRM validates dateEdits with
+  // (api/lib/focus-points.js isIsoDate, re-run at the top of the change-request
+  // handler before it charges the client a round). Borrowed from fp-approval.js
+  // when that file is on the page so there is one implementation to keep honest,
+  // with a local copy behind it so the slider still guards if that script tag is
+  // ever dropped. A regex on its own accepts 2026-02-30, and a native date input
+  // hands back partial values while the client is still typing into it.
+  function ccIsoDate(value) {
+    if (window.CPFocusPoints && typeof window.CPFocusPoints.isIsoDate === 'function') {
+      return window.CPFocusPoints.isIsoDate(value);
+    }
+    if (typeof value !== 'string') return false;
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (!m) return false;
+    var y = Number(m[1]), mo = Number(m[2]), dd = Number(m[3]);
+    if (mo < 1 || mo > 12 || dd < 1 || dd > 31) return false;
+    var probe = new Date(Date.UTC(y, mo - 1, dd));
+    return probe.getUTCFullYear() === y && probe.getUTCMonth() === mo - 1 && probe.getUTCDate() === dd;
+  }
+
+  // What <input type="date"> can actually hold, from whatever postDate holds.
+  // Legacy rows stored an ISO datetime, and feeding that to the input blanks it,
+  // which would make the seed comparison call every post a change. Anything that
+  // does not survive the strict test becomes '' (an undated post), never junk.
+  function ccDateOnly(v) {
+    if (!v) return '';
+    var m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v));
+    return m && ccIsoDate(m[1]) ? m[1] : '';
+  }
+
   function ccSlotsWithMedia(slots, post) {
     return slots.filter(function (s) { return ccPostMedia(post, s.slotKey).length > 0; });
   }
@@ -947,6 +1088,10 @@
       posts: posts,
       slots: slots,
       captionEdits: {},
+      // Client-changed post dates, keyed EXACTLY like captionEdits (post uid when
+      // the CRM has stamped one, positional index otherwise) so the two maps
+      // resolve to the same posts in the one submit that carries both.
+      dateEdits: {},
       marks: {},
       notes: {},
       decisions: [],
@@ -994,7 +1139,15 @@
     state.topBar = el('div', { class: 'cp-ccs-top' });
     state.stage = el('div', { class: 'cp-ccs-stage' });
     state.nav = el('div', { class: 'cp-ccs-nav' });
+    // Full-width banner directly under the dot rail, shown for as long as the
+    // card is read-only. A client who cannot find WHY the buttons stopped
+    // working phones Social Media instead of approving, so the explanation sits
+    // at the top of the slider rather than at the end of a scroll. Toggled in
+    // ccsRender, because read-only can also start halfway through the session
+    // when a submit comes back 409.
+    state.capNote = el('div', { class: 'cp-warn cp-ccs-capnote', text: CC_NO_ROUNDS_MSG, hidden: true });
     card.appendChild(state.topBar);
+    card.appendChild(state.capNote);
     card.appendChild(state.stage);
     card.appendChild(state.nav);
     ccsRender(state);
@@ -1009,7 +1162,8 @@
   }
 
   function ccsPendingCount(state) {
-    var count = Object.keys(state.captionEdits).length + Object.keys(state.notes).length;
+    var count = Object.keys(state.captionEdits).length + Object.keys(state.notes).length
+      + Object.keys(state.dateEdits).length;
     Object.keys(state.marks).forEach(function (k) { count += state.marks[k].length; });
     return count;
   }
@@ -1025,6 +1179,7 @@
   function ccsRender(state) {
     ccsSyncDirty(state);
     ccsRenderTop(state);
+    if (state.capNote) state.capNote.hidden = !state.readOnly;
     clear(state.stage);
     state.stage.appendChild(state.view === 'summary' ? ccsSummary(state) : ccsSlide(state, state.idx));
     ccsRenderNav(state);
@@ -1156,7 +1311,7 @@
         if (!state.readOnly && !slotApproved && decision !== 'approved') {
           var markBtn = el('button', {
             class: 'cp-ccs-markbtn', type: 'button',
-            text: marked ? 'Change requested — undo' : 'Request change on this image',
+            text: marked ? 'Change requested, tap to undo' : 'Request change on this image',
           });
           markBtn.addEventListener('click', function () {
             var list = state.marks[uid] || (state.marks[uid] = []);
@@ -1196,12 +1351,70 @@
       if (mediaDots) slide.appendChild(mediaDots);
     }
 
-    // ── Caption (social-post style, editable) ─────────────────────
     var body = el('div', { class: 'cp-ccs-body' });
-    var saveflag = el('span', { class: 'cp-ccs-saveflag', text: state.captionEdits[uid] !== undefined ? 'Edited' : '' });
     var captionLocked = state.readOnly || decision === 'approved';
+
+    // ── Post date (client editable, rides the change round) ───────
+    // The date is NOT saved on its own. It queues in state.dateEdits and goes out
+    // with the batch, because moving a post is a change request: it costs one of
+    // the three rounds and it has to reach Design with the rest of the round
+    // rather than mutating the month behind their back.
+    //
+    // Native <input type="date"> on purpose. This is opened from a WhatsApp link
+    // on a client's phone, and a hand-rolled calendar popup is the one thing on
+    // the page we cannot test on every device they own.
+    var seedDate = ccDateOnly(post.postDate);
+    var dateFlag = el('span', { class: 'cp-ccs-saveflag', text: state.dateEdits[uid] !== undefined ? 'Changed' : '' });
+    var shownDate = state.dateEdits[uid] !== undefined ? state.dateEdits[uid] : seedDate;
     body.appendChild(el('div', { class: 'cp-ccs-caphead' }, [
-      el('span', { text: captionLocked ? 'Caption' : 'Caption — tap to edit' }),
+      el('span', { text: captionLocked ? 'Post date' : 'Post date, tap to change' }),
+      dateFlag,
+    ]));
+    if (captionLocked) {
+      body.appendChild(el('div', { class: 'cp-ccs-datestatic', text: shownDate ? formatDate(shownDate) : 'No date set' }));
+    } else {
+      var dateInput = el('input', { class: 'cp-input cp-ccs-dateinput', type: 'date', value: shownDate });
+      var dateWarn = el('div', { class: 'cp-warn cp-ccs-datewarn', hidden: true });
+      dateInput.addEventListener('change', function () {
+        var v = String(dateInput.value || '').trim();
+        if (!v) {
+          // The CRM answers an empty date with 400 "A post needs a date.", and it
+          // is right to: an undated post cannot be scheduled and the calendar
+          // would silently lose a slot. Refuse it here so the client is told now
+          // instead of after the submit has already been queued.
+          dateInput.value = shownDate;
+          delete state.dateEdits[uid];
+          dateFlag.textContent = '';
+          dateWarn.textContent = 'A post needs a date, the old one is back.';
+          dateWarn.hidden = false;
+          ccsSyncDirty(state);
+          return;
+        }
+        if (!ccIsoDate(v)) {
+          dateWarn.textContent = 'Please pick a real date.';
+          dateWarn.hidden = false;
+          return;
+        }
+        dateWarn.hidden = true;
+        if (v === seedDate) delete state.dateEdits[uid];
+        else state.dateEdits[uid] = v;
+        dateFlag.textContent = state.dateEdits[uid] !== undefined ? 'Changed' : '';
+        ccsSyncDirty(state);
+      });
+      body.appendChild(dateInput);
+      // Say what a date change costs AT THE POINT OF EDIT, not only on the
+      // summary slide. Moving a post is not a silent save: it sends the whole
+      // calendar back to us and spends one of the client's three rounds, and a
+      // client who learns that two screens later has already spent it.
+      body.appendChild(el('p', { class: 'cp-note cp-ccs-datenote',
+        text: 'Changing a date sends the calendar back to us as a change request.' }));
+      body.appendChild(dateWarn);
+    }
+
+    // ── Caption (social-post style, editable) ─────────────────────
+    var saveflag = el('span', { class: 'cp-ccs-saveflag', text: state.captionEdits[uid] !== undefined ? 'Edited' : '' });
+    body.appendChild(el('div', { class: 'cp-ccs-caphead' }, [
+      el('span', { text: captionLocked ? 'Caption' : 'Caption, tap to edit' }),
       saveflag,
     ]));
 
@@ -1257,9 +1470,9 @@
     var warn = el('div', { class: 'cp-warn', hidden: true });
 
     if (decision === 'skip') {
-      decide.appendChild(el('span', { class: 'cp-ccs-status', text: 'Nothing to approve yet — artwork still in production.' }));
+      decide.appendChild(el('span', { class: 'cp-ccs-status', text: 'Nothing to approve yet, artwork still in production.' }));
     } else if (decision === 'approved') {
-      decide.appendChild(el('span', { class: 'cp-ccs-status approved', text: '✓ Approved' }));
+      decide.appendChild(el('span', { class: 'cp-ccs-status approved', text: 'Approved' }));
     } else if (decision === 'changes') {
       var st = el('span', { class: 'cp-ccs-status changes', text: 'Changes requested (queued)' });
       var undo = el('button', { class: 'cp-ccs-undobtn', type: 'button', text: 'Change decision' });
@@ -1279,11 +1492,16 @@
       if (!state.readOnly) {
         var changesBtn = el('button', { class: 'cp-btn cp-ccs-changesbtn', type: 'button', text: 'Request changes' });
         changesBtn.addEventListener('click', function () {
+          // A changed date counts as signal. Without this clause a date-only
+          // round is refused here, and then refused a second time by the "No
+          // changes queued" guard on submit, so the client can move a post and
+          // have no way at all to send it.
           var hasSignal = (state.marks[uid] || []).length ||
             (state.notes[uid] || '').trim() ||
-            state.captionEdits[uid] !== undefined;
+            state.captionEdits[uid] !== undefined ||
+            state.dateEdits[uid] !== undefined;
           if (!hasSignal) {
-            warn.textContent = 'Mark an image ("Request change on this image"), add a note or edit the caption first.';
+            warn.textContent = 'Mark an image ("Request change on this image"), add a note, edit the caption or change the date first.';
             warn.hidden = false;
             return;
           }
@@ -1358,6 +1576,7 @@
       delete state.marks[uid];
       delete state.notes[uid];
       delete state.captionEdits[uid];
+      delete state.dateEdits[uid];
       state.decisions[i] = 'approved';
       ccsAdvance(state);
     }).catch(function (res) {
@@ -1372,17 +1591,36 @@
   function ccsSummary(state) {
     var box = el('div', { class: 'cp-ccs-slide cp-ccs-summary' });
     box.appendChild(el('h3', { class: 'cp-ccs-sumtitle', text: 'Review summary' }));
+    // The rounds pill above the slider is a chip the client has to decode. On
+    // the slide where they decide whether to spend a round, say it in words.
+    if (!state.readOnly) {
+      box.appendChild(el('p', { class: 'cp-note cp-ccs-roundline',
+        text: 'This is change round ' + (CC_MAX_ROUNDS - state.roundsLeft + 1) + ' of ' + CC_MAX_ROUNDS + '.' }));
+    }
 
     var changed = [];
+    var undecided = [];
+    var approvedCount = 0;
     state.posts.forEach(function (p, i) {
       var dec = state.decisions[i];
-      var label = 'Post ' + (i + 1) + (p.postDate ? ' — ' + formatDate(p.postDate) : '');
+      var label = 'Post ' + (i + 1) + (p.postDate ? ', ' + formatDate(p.postDate) : '');
       var badge;
-      if (dec === 'approved') badge = el('span', { class: 'cp-ccs-status approved', text: '✓ Approved' });
+      if (dec === 'approved') { badge = el('span', { class: 'cp-ccs-status approved', text: 'Approved' }); approvedCount += 1; }
       else if (dec === 'changes') { badge = el('span', { class: 'cp-ccs-status changes', text: 'Changes requested' }); changed.push(i); }
       else if (dec === 'skip') badge = el('span', { class: 'cp-ccs-status', text: 'No artwork yet' });
-      else badge = el('span', { class: 'cp-ccs-status', text: 'Pending' });
-      box.appendChild(el('div', { class: 'cp-ccs-sumrow' }, [el('span', { text: label }), badge]));
+      else { badge = el('span', { class: 'cp-ccs-status', text: 'Not decided yet' }); undecided.push(i); }
+      // Each row goes back to its own slide. A client who wants to re-check one
+      // post before submitting should not have to swipe past the ones they have
+      // already settled. Going BACK is always allowed, so this adds no way round
+      // the decide-before-you-advance rule.
+      var sumRow = el('div', { class: 'cp-ccs-sumrow cp-ccs-sumrow-link', role: 'button', tabindex: '0' },
+        [el('span', { text: label }), badge]);
+      var jump = function () { state.view = 'slide'; state.idx = i; ccsRender(state); };
+      sumRow.addEventListener('click', jump);
+      sumRow.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); jump(); }
+      });
+      box.appendChild(sumRow);
     });
 
     var wrap = el('div', { class: 'cp-ccs-submitwrap' });
@@ -1394,29 +1632,41 @@
         text: 'Submit change requests (' + state.roundsLeft + ' left)',
       });
       submitBtn.disabled = state.readOnly;
-      if (state.readOnly) {
-        warn.textContent = 'No change rounds left — please approve the remaining posts instead.';
-        warn.hidden = false;
-      }
       submitBtn.addEventListener('click', function () {
         ccsSubmitChanges(state, submitBtn, warn);
       });
       wrap.appendChild(submitBtn);
       wrap.appendChild(el('p', { class: 'cp-note', text: 'This sends all your queued changes as ONE change round.' }));
+    } else if (undecided.length) {
+      // Nothing queued but posts still undecided. The all-done tick below would
+      // be a lie here, and it is the screen a read-only client lands on, so say
+      // what is actually outstanding.
+      wrap.appendChild(el('p', { class: 'cp-note', text: 'You have approved ' + approvedCount
+        + ' of ' + state.posts.length + ' posts. Nothing has been sent back for changes.' }));
     } else {
       wrap.appendChild(el('div', { class: 'cp-ccs-alldone' }, [
         el('div', { class: 'cp-tick', text: '✓' }),
-        el('p', { text: 'All posts reviewed — thank you! Our team takes it from here.' }),
+        el('p', { text: 'All posts reviewed, thank you. Our team takes it from here.' }),
       ]));
+    }
+    // The out-of-rounds sentence belongs to the read-only state, not to the
+    // change list: `changed` can only be non-empty via the Request changes
+    // button that read-only has already removed, so hanging it off that branch
+    // made it unreachable for exactly the client who needed it.
+    if (state.readOnly) {
+      warn.textContent = CC_NO_ROUNDS_MSG;
+      warn.hidden = false;
     }
     wrap.appendChild(warn);
     box.appendChild(wrap);
     return box;
   }
 
-  // ONE submit = ONE change round: every mark, note and caption edit across
-  // all posts goes out as a single change-request (captionEdits keyed by post
-  // uid/index — the shape the CRM writes back into posts[].captionHtml).
+  // ONE submit = ONE change round: every mark, note, caption edit and date change
+  // across all posts goes out as a single change-request. captionEdits and
+  // dateEdits share one key contract (post uid/index) and the CRM resolves both
+  // the same way, index first then uid, into posts[].captionHtml and
+  // posts[].postDate.
   function ccsSubmitChanges(state, btn, warn) {
     warn.hidden = true;
     var lines = [];
@@ -1424,14 +1674,19 @@
       var uid = ccUidOf(p, idx);
       var label = 'Post ' + (idx + 1) + (p.postDate ? ' (' + formatDate(p.postDate) + ')' : '');
       (state.marks[uid] || []).forEach(function (m) {
-        lines.push(label + ' — ' + m.slotLabel + ': change requested on "' + m.name + '"');
+        lines.push(label + ', ' + m.slotLabel + ': change requested on "' + m.name + '"');
       });
       var note = (state.notes[uid] || '').trim();
-      if (note) lines.push(label + ' — note: ' + note);
-      if (state.captionEdits[uid] !== undefined) lines.push(label + ' — caption edited.');
+      if (note) lines.push(label + ', note: ' + note);
+      if (state.captionEdits[uid] !== undefined) lines.push(label + ', caption edited.');
+      // Its own line, so the free-text body records a date move in words as well
+      // as in data, and so a date-only round is never an empty body.
+      if (state.dateEdits[uid] !== undefined) {
+        lines.push(label + ', date changed to ' + formatDate(state.dateEdits[uid]) + '.');
+      }
     });
     if (!lines.length) {
-      warn.textContent = 'No changes queued — go back and mark an image or edit a caption.';
+      warn.textContent = 'No changes queued, go back and mark an image, edit a caption or change a date.';
       warn.hidden = false;
       return;
     }
@@ -1441,6 +1696,10 @@
       deliverableId: state.d.id,
       body: lines.join('\n'),
       captionEdits: state.captionEdits,
+      // Sent alongside captionEdits in the same POST, same key contract. An older
+      // CRM ignores the key entirely, which drops the date change silently, which
+      // is why the server side of this ships first.
+      dateEdits: state.dateEdits,
       screenshots: [],
       portalToken: state.token,
     }).then(function (res) {
@@ -1450,8 +1709,11 @@
       } else if (res.status === 409) {
         state.roundsLeft = 0;
         state.readOnly = true;
+        // The card is not re-rendered here (that would throw away this warn node
+        // mid-message), so the banner is revealed by hand.
+        if (state.capNote) state.capNote.hidden = false;
         btn.textContent = 'Submit change requests (0 left)';
-        warn.textContent = 'No change rounds left — please approve.';
+        warn.textContent = CC_NO_ROUNDS_MSG;
         warn.hidden = false;
       } else {
         btn.disabled = false;
@@ -1468,12 +1730,72 @@
   }
 
   // ── Focus-points card (status materials_requested / focus_points_sent) ──
-  // The month's plan before artwork exists: per-post date + focus-points text.
-  // Edits save per row on blur via the CRM's focus-points/description endpoint
-  // (dates are locked server-side); one Approve advances the whole calendar to
-  // materials_received. No change-round cap at this stage.
-  function renderCcFocusPointsCard(portalToken, d) {
-    var posts = postsOf(d);
+  // The month's plan before artwork exists: per-row date + focus-points text.
+  // Edits save per row on blur via the CRM's focus-points/description endpoint;
+  // one Approve advances the whole calendar. No change-round cap at this stage.
+  //
+  // ONE STORE, metadata.focusPoints[]. This card and the deep-linked page at
+  // /focus-points/:token/:id are both live for the same row, and they used to
+  // write two different arrays: this card wrote posts[].captionHtml keyed on
+  // position, the deep link writes focusPoints[].description keyed on id. The
+  // CRM's migrateFromPosts copies posts into focusPoints ONCE and never syncs
+  // again, so whichever surface the client touched second won and Design could
+  // read text the client had already replaced. So this card now reads
+  // focusPoints[] whenever the row has one and addresses rows by focusPointId,
+  // exactly like the deep link. posts[] is the fallback for a legacy row that
+  // has never been migrated (migration is lazy, on the deep link's own GET),
+  // and only that fallback still sends postIndex/postUid.
+  //
+  // readOnly renders the same table as a receipt: the client has already approved,
+  // and the row stays on their approvals list so the link they were sent keeps
+  // resolving. An editable card there would offer a save the CRM refuses with a
+  // 409, which reads to the client as "my approval was lost".
+  //
+  // A focusPoints row with no id renders read-only whatever the status says. Every
+  // write on this path addresses a row BY ID, and guessing a position would edit
+  // somebody else's row the first time staff reordered the month. Same rule as
+  // fp-approval.js.
+  function ccFocusRowsOf(d) {
+    var meta = metaOf(d);
+    var raw = Array.isArray(meta.focusPoints) ? meta.focusPoints : [];
+    if (raw.length) {
+      // Borrow the deep-link page's normaliser when it is on the page, so sort
+      // order, numbering and the id rules have ONE implementation.
+      var list = (window.CPFocusPoints && typeof window.CPFocusPoints.focusPointsOf === 'function')
+        ? window.CPFocusPoints.focusPointsOf(meta)
+        : raw.map(function (fp, idx) {
+          return {
+            id: (fp && fp.id != null && String(fp.id).trim() !== '') ? String(fp.id).trim() : null,
+            number: (fp && typeof fp.number === 'number') ? fp.number : idx + 1,
+            description: (fp && fp.description != null) ? String(fp.description) : '',
+            postDate: (fp && fp.postDate) ? String(fp.postDate) : '',
+          };
+        });
+      return list.map(function (fp) {
+        return {
+          focusPointId: fp.id,
+          number: fp.number,
+          postDate: fp.postDate,
+          html: fp.description,
+          postUid: null,
+          postIndex: null,
+        };
+      });
+    }
+    return postsOf(d).map(function (post, idx) {
+      return {
+        focusPointId: null,
+        number: idx + 1,
+        postDate: post.postDate || '',
+        html: post.captionHtml || '',
+        postUid: post.postUid || null,
+        postIndex: idx,
+      };
+    });
+  }
+
+  function renderCcFocusPointsCard(portalToken, d, readOnly) {
+    var rows = ccFocusRowsOf(d);
     var token = currentRoute().token || portalToken;
 
     var head = el('div', { class: 'cp-card-head' }, [
@@ -1481,18 +1803,22 @@
         el('h2', { class: 'cp-card-title', text: d.title || d.name || 'Content Calendar' }),
         el('div', { class: 'cp-wd-round', text: 'Focus points approval' }),
       ]),
-      el('span', { class: 'cp-badge cp-badge-action', text: 'Approval required' }),
+      readOnly
+        ? el('span', { class: 'cp-badge cp-badge-approved', text: 'Approved' })
+        : el('span', { class: 'cp-badge cp-badge-action', text: 'Approval required' }),
     ]);
-    var card = el('div', { class: 'cp-card cp-card-action cp-cc-card' }, [head]);
+    var card = el('div', { class: 'cp-card cp-cc-card ' + (readOnly ? 'cp-card-approved' : 'cp-card-action') }, [head]);
 
-    if (!posts.length) {
+    if (!rows.length) {
       card.appendChild(el('p', { class: 'cp-note', text: 'No focus points to review for this calendar yet.' }));
       return card;
     }
 
     card.appendChild(el('p', {
       class: 'cp-note',
-      text: 'These are the planned focus points for each post. Edit the text directly if you want something different — changes save automatically — then approve to move production ahead.',
+      text: readOnly
+        ? 'You approved these focus points. Our team is working on the artwork now.'
+        : 'These are the planned focus points for each post. Edit the text directly if you want something different, changes save automatically, then approve to move production ahead.',
     }));
 
     var headRow = el('tr', {}, [
@@ -1501,35 +1827,46 @@
       el('th', { class: 'cp-cc-th-caption', text: 'Focus points' }),
     ]);
     var tbody = el('tbody');
-    posts.forEach(function (post, idx) {
+    rows.forEach(function (row) {
+      // An id-less focusPoints row is read-only; a legacy posts[] row keeps its
+      // positional write surface, which is the only one it has.
+      var rowEditable = !readOnly && (row.focusPointId != null || row.postIndex != null);
       var tr = el('tr', { class: 'cp-cc-row' });
-      tr.appendChild(el('td', { 'data-label': '#', class: 'cp-cc-num', text: String(idx + 1) }));
-      tr.appendChild(el('td', { 'data-label': 'Post date', text: post.postDate ? formatDate(post.postDate) : '—' }));
+      tr.appendChild(el('td', { 'data-label': '#', class: 'cp-cc-num', text: String(row.number) }));
+      tr.appendChild(el('td', { 'data-label': 'Post date', text: row.postDate ? formatDate(row.postDate) : 'No date set' }));
       var td = el('td', { 'data-label': 'Focus points', class: 'cp-cc-td-caption' });
-      var editor = el('div', { class: 'cp-editor cp-cc-editor', contenteditable: 'true', html: post.captionHtml || '' });
+      var editor = el('div', {
+        class: 'cp-editor cp-cc-editor',
+        contenteditable: rowEditable ? 'true' : 'false',
+        html: row.html,
+      });
       var indicator = el('span', { class: 'cp-cc-saveflag', text: '' });
       var seed = editor.innerHTML;
-      editor.addEventListener('blur', function () {
+      if (rowEditable) editor.addEventListener('blur', function () {
         var html = editor.innerHTML;
         if (html === seed) return;
-        indicator.textContent = 'Saving…';
+        indicator.textContent = 'Saving...';
         api('POST', '/api/request-forms/public/portal/focus-points/description', {
           deliverableId: d.id,
-          postUid: post.postUid || undefined,
-          postIndex: idx,
+          // focusPointId when the row has one, the legacy positional pair
+          // otherwise. The CRM accepts both and branches on which arrived.
+          focusPointId: row.focusPointId || undefined,
+          postUid: row.focusPointId ? undefined : (row.postUid || undefined),
+          postIndex: row.focusPointId ? undefined : row.postIndex,
           description: html,
           portalToken: token,
         }).then(function (res) {
           if (res.ok) {
             seed = html;
+            row.html = html;
             indicator.textContent = 'Saved';
           } else {
             editor.innerHTML = seed;
-            indicator.textContent = (res.data && res.data.error) || 'Could not save — reverted.';
+            indicator.textContent = (res.data && res.data.error) || 'Could not save, reverted.';
           }
         }).catch(function () {
           editor.innerHTML = seed;
-          indicator.textContent = 'Could not save — reverted.';
+          indicator.textContent = 'Could not save, reverted.';
         });
       });
       td.appendChild(editor);
@@ -1540,6 +1877,8 @@
 
     var table = el('table', { class: 'cp-cc-table cp-cc-fp-table' }, [el('thead', {}, [headRow]), tbody]);
     card.appendChild(el('div', { class: 'cp-cc-tablewrap' }, [table]));
+
+    if (readOnly) return card;
 
     var warn = el('div', { class: 'cp-warn', hidden: true });
     var approveBtn = el('button', { class: 'cp-btn cp-btn-approve', type: 'button', text: 'Approve focus points' });
@@ -1804,7 +2143,7 @@
         } else if (res.status === 409) {
           btn.disabled = false;
           btn.textContent = 'Send change request';
-          warn.textContent = 'No change rounds left — please approve.';
+          warn.textContent = CC_NO_ROUNDS_MSG;
           warn.hidden = false;
         } else {
           btn.disabled = false;
@@ -2155,7 +2494,7 @@
         } else if (res.status === 409) {
           btn.disabled = false;
           btn.textContent = 'Send change request';
-          warn.textContent = 'No change rounds left — please approve.';
+          warn.textContent = CC_NO_ROUNDS_MSG;
           warn.hidden = false;
         } else {
           btn.disabled = false;
@@ -2776,7 +3115,7 @@
         } else if (res.status === 409) {
           btn.disabled = false;
           btn.textContent = 'Send change request';
-          warn.textContent = 'No change rounds left — please approve.';
+          warn.textContent = CC_NO_ROUNDS_MSG;
           warn.hidden = false;
         } else {
           btn.disabled = false;
@@ -2959,7 +3298,7 @@
         } else if (res.status === 409) {
           btn.disabled = false;
           btn.textContent = 'Send change request';
-          warn.textContent = 'No change rounds left — please approve.';
+          warn.textContent = CC_NO_ROUNDS_MSG;
           warn.hidden = false;
         } else {
           btn.disabled = false;
@@ -3473,6 +3812,305 @@
   }
 
   // ── Router (path-based, with hash fallback) ──────────────────────
+
+  // FLOW 6 - PORTAL BRANDING EDITOR   /editor  (#<portal_token>&k=<jwt>)
+  // Staff-only. CRM mints editorUrl as origin + '/editor#' + portal_token and
+  // appends '&k=' + jwt into the SAME fragment so the write credential never
+  // hits a query string, access log, or Referer. The portal_token in the hash
+  // is what GET /public/:portalToken resolves; k is sent as X-Editor-Token on
+  // save. A missing or unknown token is NOT the empty landing page.
+  function parseEditorHash() {
+    var raw = (window.location.hash || '').replace(/^#/, '');
+    var token = '';
+    var key = '';
+    if (!raw) return { token: token, key: key };
+    var parts = raw.split('&');
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i];
+      if (!part) continue;
+      var eq = part.indexOf('=');
+      if (eq === -1) {
+        if (!token) {
+          try { token = decodeURIComponent(part); } catch (e) { token = part; }
+        }
+      } else {
+        var k = part.slice(0, eq);
+        var v = part.slice(eq + 1);
+        try { v = decodeURIComponent(v); } catch (e2) { /* keep raw */ }
+        if (k === 'k') key = v;
+        else if (!token) {
+          try { token = decodeURIComponent(part); } catch (e3) { token = part; }
+        }
+      }
+    }
+    return { token: token, key: key };
+  }
+
+  function goBackOrClose() {
+    if (window.history.length > 1) {
+      window.history.back();
+      return;
+    }
+    try { window.close(); } catch (e) { /* ignore */ }
+  }
+
+  function unknownPage(msg) {
+    return el('div', { class: 'cp-error' }, [
+      el('h1', { class: 'cp-h1', text: 'This link doesn\'t match a page' }),
+      el('p', { class: 'cp-sub', text: msg || 'Open the link you were sent from Agri360.' }),
+      el('button', {
+        class: 'cp-btn', type: 'button', text: 'Go back',
+        onclick: function () { goBackOrClose(); }
+      }),
+    ]);
+  }
+
+  function editorConfigured(b) {
+    if (!b || typeof b !== 'object') return false;
+    if (!(typeof b.displayName === 'string' && b.displayName.trim())) return false;
+    if (!(typeof b.primary === 'string' && /^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(b.primary.trim()))) return false;
+    var logo = typeof b.logoUrl === 'string' ? b.logoUrl.trim() : '';
+    var mark = typeof b.wordmark === 'string' ? b.wordmark.trim() : '';
+    return !!(logo || mark);
+  }
+
+  function loadEditor(portalToken, editorKey) {
+    if (!portalToken) {
+      return render(unknownPage('This editor link is missing a client token. Go back to Agri360 and click Set up portal again.'));
+    }
+    render(el('div', { class: 'cp-loading', text: 'Loading the portal editor.' }));
+    api('GET', '/api/portal-branding/public/' + encodeURIComponent(portalToken)).then(function (r) {
+      if (r.status === 404 || !r.ok || !r.data) {
+        return render(unknownPage('This link doesn\'t match a client portal. Go back to Agri360 and open Set up portal from that client.'));
+      }
+      renderEditor(portalToken, editorKey, r.data);
+    }).catch(function () {
+      render(unknownPage('Could not open the portal editor. Go back to Agri360 and try Set up portal again.'));
+    });
+  }
+
+  function renderEditor(portalToken, editorKey, payload) {
+    var branding = (payload && payload.branding && typeof payload.branding === 'object')
+      ? payload.branding
+      : {};
+    var state = {
+      displayName: branding.displayName || payload.name || '',
+      logoUrl: branding.logoUrl || '',
+      wordmark: branding.wordmark || '',
+      primary: branding.primary || '#2d7a3e',
+      primaryHover: branding.primaryHover || '#25652f',
+      primaryContrast: branding.primaryContrast || '#ffffff',
+      accent: branding.accent || '#f0a202',
+      radius: branding.radius == null ? 12 : branding.radius,
+      font: branding.font || "'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif",
+      welcomeTitle: branding.welcomeTitle || '',
+      welcomeNote: branding.welcomeNote || '',
+      supportName: branding.supportName || '',
+      supportEmail: branding.supportEmail || '',
+      poweredBy: branding.poweredBy !== false,
+    };
+
+    var previewCard = el('div', { class: 'cp-editor-preview' });
+    var statusEl = el('p', { class: 'cp-note' });
+    var saveBtn = el('button', {
+      class: 'cp-btn cp-btn-primary', type: 'button', text: editorKey ? 'Save branding' : 'Save branding'
+    });
+    if (!editorKey) saveBtn.disabled = true;
+
+    function field(label, key, kind) {
+      var input;
+      if (kind === 'textarea') {
+        input = el('textarea', { class: 'cp-textarea', rows: '3' });
+        input.value = state[key] == null ? '' : String(state[key]);
+      } else if (kind === 'color') {
+        var wrap = el('div', { class: 'cp-color-row' });
+        var picker = el('input', { type: 'color' });
+        var hex = /^#[0-9a-fA-F]{6}$/.test(String(state[key] || '')) ? state[key] : '#2d7a3e';
+        picker.value = hex;
+        input = el('input', { class: 'cp-input', type: 'text' });
+        input.value = state[key] == null ? '' : String(state[key]);
+        picker.addEventListener('input', function () {
+          input.value = picker.value;
+          state[key] = picker.value;
+          paintPreview();
+        });
+        input.addEventListener('input', function () {
+          state[key] = input.value;
+          if (/^#[0-9a-fA-F]{6}$/.test(input.value)) picker.value = input.value;
+          paintPreview();
+        });
+        wrap.appendChild(picker);
+        wrap.appendChild(input);
+        return el('div', { class: 'cp-field' }, [
+          el('label', { class: 'cp-field-label', text: label }),
+          wrap,
+        ]);
+      } else if (kind === 'number') {
+        input = el('input', { class: 'cp-input', type: 'number', min: '0', max: '28' });
+        input.value = state[key] == null ? '' : String(state[key]);
+      } else if (kind === 'checkbox') {
+        input = el('input', { type: 'checkbox' });
+        input.checked = !!state[key];
+        input.addEventListener('change', function () { state[key] = input.checked; paintPreview(); });
+        return el('div', { class: 'cp-field' }, [
+          el('label', { class: 'cp-field-label' }, [
+            input,
+            document.createTextNode(' ' + label),
+          ]),
+        ]);
+      } else {
+        input = el('input', { class: 'cp-input', type: kind || 'text' });
+        input.value = state[key] == null ? '' : String(state[key]);
+      }
+      if (kind !== 'checkbox' && kind !== 'color') {
+        input.addEventListener('input', function () {
+          if (kind === 'number') state[key] = Number(input.value);
+          else state[key] = input.value;
+          paintPreview();
+        });
+      }
+      return el('div', { class: 'cp-field' }, [
+        el('label', { class: 'cp-field-label', text: label }),
+        input,
+      ]);
+    }
+
+    var logoFile = el('input', { class: 'cp-input', type: 'file', accept: 'image/*' });
+    logoFile.addEventListener('change', function () {
+      var file = logoFile.files && logoFile.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function () {
+        state.logoUrl = String(reader.result || '');
+        logoUrlInput.value = state.logoUrl.indexOf('data:') === 0 ? '(image attached)' : state.logoUrl;
+        paintPreview();
+      };
+      reader.readAsDataURL(file);
+    });
+    var logoUrlInput = el('input', { class: 'cp-input', type: 'text', placeholder: 'https:// or paste a data URL' });
+    logoUrlInput.value = state.logoUrl && state.logoUrl.indexOf('data:') === 0 ? '(image attached)' : (state.logoUrl || '');
+    logoUrlInput.addEventListener('input', function () {
+      if (logoUrlInput.value !== '(image attached)') {
+        state.logoUrl = logoUrlInput.value;
+        paintPreview();
+      }
+    });
+
+    function paintPreview() {
+      clear(previewCard);
+      var mark = (state.wordmark || state.displayName || 'Preview').trim();
+      var swatch = el('div', { class: 'cp-editor-swatch', text: mark });
+      swatch.style.background = state.primary || '#2d7a3e';
+      swatch.style.color = state.primaryContrast || '#ffffff';
+      swatch.style.borderRadius = (Number(state.radius) || 0) + 'px';
+      swatch.style.fontFamily = state.font || 'inherit';
+      if (state.logoUrl && (state.logoUrl.indexOf('data:') === 0 || state.logoUrl.indexOf('http') === 0)) {
+        var img = el('img', { class: 'cp-editor-logo', alt: mark });
+        img.src = state.logoUrl;
+        swatch.textContent = '';
+        swatch.appendChild(img);
+      }
+      var ready = editorConfigured(state);
+      previewCard.appendChild(el('div', { class: 'cp-editor-preview-label', text: 'Client preview' }));
+      previewCard.appendChild(swatch);
+      previewCard.appendChild(el('p', {
+        class: 'cp-note',
+        text: ready
+          ? 'Ready. Focus points can go out once you save.'
+          : 'Needs a display name, a colour, and a logo or wordmark before this portal is set up.'
+      }));
+      if (state.welcomeTitle) previewCard.appendChild(el('p', { class: 'cp-editor-welcome', text: state.welcomeTitle }));
+    }
+
+    saveBtn.addEventListener('click', function () {
+      if (!editorKey) {
+        statusEl.textContent = 'This editor session has no save token. Go back to Agri360 and click Set up portal again.';
+        return;
+      }
+      saveBtn.disabled = true;
+      statusEl.textContent = 'Saving.';
+      var body = {
+        displayName: state.displayName,
+        logoUrl: state.logoUrl === '(image attached)' ? branding.logoUrl : state.logoUrl,
+        wordmark: state.wordmark,
+        primary: state.primary,
+        primaryHover: state.primaryHover,
+        primaryContrast: state.primaryContrast,
+        accent: state.accent,
+        radius: Number(state.radius) || 0,
+        font: state.font,
+        welcomeTitle: state.welcomeTitle,
+        welcomeNote: state.welcomeNote,
+        supportName: state.supportName,
+        supportEmail: state.supportEmail,
+        poweredBy: !!state.poweredBy,
+      };
+      api('PUT', '/api/portal-branding/public/' + encodeURIComponent(portalToken) + '/branding', body, {
+        'X-Editor-Token': editorKey,
+      }).then(function (r) {
+        saveBtn.disabled = false;
+        if (!r.ok) {
+          statusEl.textContent = (r.data && (r.data.error || r.data.userMessage))
+            || 'Could not save branding (' + r.status + ').';
+          return;
+        }
+        if (r.data && r.data.branding) {
+          Object.keys(r.data.branding).forEach(function (k) {
+            if (k !== 'configuredAt' && Object.prototype.hasOwnProperty.call(state, k)) {
+              state[k] = r.data.branding[k];
+            }
+          });
+        }
+        statusEl.textContent = editorConfigured(state)
+          ? 'Saved. This portal is set up. You can close this tab and go back to Agri360.'
+          : 'Saved. Add a logo or wordmark so the portal counts as set up.';
+        paintPreview();
+      }).catch(function () {
+        saveBtn.disabled = false;
+        statusEl.textContent = 'Could not save branding. Try again.';
+      });
+    });
+
+    var form = el('div', { class: 'cp-editor-form' }, [
+      el('h1', { class: 'cp-h1', text: 'Portal branding' }),
+      el('p', { class: 'cp-sub', text: 'This is what the client sees on their portal. Save before you close the tab.' }),
+      editorKey ? null : el('p', { class: 'cp-note', text: 'This editor session has no save token. Go back to Agri360 and click Set up portal again.' }),
+      field('Display name', 'displayName', 'text'),
+      el('div', { class: 'cp-field' }, [
+        el('label', { class: 'cp-field-label', text: 'Logo' }),
+        logoFile,
+        logoUrlInput,
+      ]),
+      field('Wordmark (shown when there is no logo)', 'wordmark', 'text'),
+      el('div', { class: 'cp-editor-row' }, [
+        field('Primary', 'primary', 'color'),
+        field('Primary hover', 'primaryHover', 'color'),
+      ]),
+      el('div', { class: 'cp-editor-row' }, [
+        field('Text on primary', 'primaryContrast', 'color'),
+        field('Accent', 'accent', 'color'),
+      ]),
+      field('Corner radius (0–28)', 'radius', 'number'),
+      field('Font', 'font', 'text'),
+      field('Welcome title', 'welcomeTitle', 'text'),
+      field('Welcome note', 'welcomeNote', 'textarea'),
+      field('Support name', 'supportName', 'text'),
+      field('Support email', 'supportEmail', 'email'),
+      field('Show ProAgri footer credit', 'poweredBy', 'checkbox'),
+      el('div', { class: 'cp-editor-actions' }, [
+        saveBtn,
+        el('button', {
+          class: 'cp-btn', type: 'button', text: 'Go back',
+          onclick: function () { goBackOrClose(); }
+        }),
+      ]),
+      statusEl,
+    ]);
+
+    paintPreview();
+    render(el('div', { class: 'cp-editor-layout' }, [form, previewCard]));
+  }
+
   function currentRoute() {
     var p = window.location.pathname;
     // /video-request is tokenless — the #prefill hash carries the routing. Match
@@ -3480,6 +4118,13 @@
     if (/^\/video-request\/?$/.test(p) ||
         (/^#?\/?video-request/.test(window.location.hash.replace(/^#/, '')) && p === '/')) {
       return { view: 'video-request', token: null };
+    }
+    // /editor — staff branding editor. Path is bare; the portal_token and the
+    // mint JWT both live in the fragment (#<portal_token>&k=<jwt>), never the
+    // query string. Match here so unknown-path landing cannot swallow it.
+    if (/^\/editor\/?$/.test(p)) {
+      var ed = parseEditorHash();
+      return { view: 'editor', token: ed.token, editorKey: ed.key };
     }
     // /preview/:portalToken/:itemId — read-only collateral preview (CRM "Preview"
     // button). Portal-scoped: the CRM now passes the client's portal_token as the
@@ -3494,6 +4139,21 @@
     if (pv) {
       if (pv[2]) return { view: 'preview', token: decodeURIComponent(pv[1]), itemId: decodeURIComponent(pv[2]) };
       return { view: 'preview', token: null, itemId: decodeURIComponent(pv[1]) };
+    }
+
+    // /focus-points/:portalToken/:deliverableId — the client's month plan behind
+    // the link we email them. Matched here, ABOVE the (video-forms|form|approvals|
+    // dashboard) alternation, for the same reason the preview branch is: the
+    // alternation is a two-segment pattern and a third segment would be dropped
+    // silently rather than 404, landing the client on somebody's approvals list.
+    // Both segments are required — a tokenless /focus-points/:id cannot be served
+    // because the CRM re-scopes the deliverable to the token's client (IDOR gate).
+    var fp = p.match(/^\/focus-points\/([^\/]+)\/([^\/]+)/);
+    if (!fp && window.location.hash) {
+      fp = window.location.hash.replace(/^#/, '').match(/^\/?focus-points\/([^\/]+)\/([^\/]+)/);
+    }
+    if (fp) {
+      return { view: 'focus-points', token: decodeURIComponent(fp[1]), itemId: decodeURIComponent(fp[2]) };
     }
 
     // 'video-forms' is listed FIRST so the alternation can never be shadowed by
@@ -3512,18 +4172,17 @@
     var r = currentRoute();
     if (r.view === 'video-request') return loadVideoRequest();
     if (r.view === 'preview' && r.itemId) return loadPreview(r.token, r.itemId);
+    if (r.view === 'focus-points' && r.token && r.itemId) return loadFocusPoints(r.token, r.itemId);
     if (r.view === 'form' && r.token) return loadForm(r.token);
     if (r.view === 'approvals' && r.token) return loadApprovals(r.token);
     if (r.view === 'dashboard' && r.token) return loadDashboard(r.token);
     if (r.view === 'video-forms' && r.token) return loadVideoForms(r.token);
+    if (r.view === 'editor') return loadEditor(r.token, r.editorKey);
     return render(landing());
   }
 
   function landing() {
-    return el('div', { class: 'cp-empty' }, [
-      el('h1', { class: 'cp-h1', text: 'ProAgri Client Portal' }),
-      el('p', { class: 'cp-sub', text: 'Please open the link you were sent to view your form or content approvals.' }),
-    ]);
+    return unknownPage('This address is not a form, dashboard, or portal editor. Open the link you were sent from Agri360.');
   }
 
   window.addEventListener('hashchange', route);

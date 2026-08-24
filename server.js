@@ -76,6 +76,12 @@ app.all('/api/*', async (req, res) => {
     'Accept': 'application/json',
     'X-Portal-Key': PORTAL_KEY,
   };
+  // Staff branding editor: the JWT rides in the URL fragment and is sent by
+  // the SPA as X-Editor-Token. Forward it so PUT /public/:token/branding can
+  // authorize the write. Never log this header.
+  if (req.headers['x-editor-token']) {
+    headers['X-Editor-Token'] = String(req.headers['x-editor-token']);
+  }
 
   // The native in-portal video request form submits to the CRM's sister-app
   // callback, which is authenticated by a shared secret (X-Sister-Auth), NOT the
