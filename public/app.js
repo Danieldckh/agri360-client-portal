@@ -8,6 +8,8 @@
  *   2) /approvals/:portalToken   — approve / request changes on CC deliverables.
  *   3) /dashboard/:portalToken   — content overview + previous approvals.
  *   4) /video-forms/:portalToken — the client's video request forms, by month.
+ *   5) /editor                  — staff branding editor. Token lives in the
+ *                                 hash: #<portal_token>&k=<jwt>.
  *
  * The :portalToken is an opaque, unguessable string (clients.portal_token).
  * It is passed straight through to the CRM, which resolves it to a client —
@@ -60,8 +62,13 @@
   }
 
   // ── API helper (same-origin proxy) ───────────────────────────────
-  function api(method, pathName, body) {
+  function api(method, pathName, body, extraHeaders) {
     var init = { method: method, headers: { 'Accept': 'application/json' } };
+    if (extraHeaders) {
+      Object.keys(extraHeaders).forEach(function (k) {
+        if (extraHeaders[k] != null) init.headers[k] = extraHeaders[k];
+      });
+    }
     if (body !== undefined) {
       if (typeof FormData !== 'undefined' && body instanceof FormData) {
         // Let the browser set Content-Type (incl. the multipart boundary).
@@ -3683,6 +3690,305 @@
   }
 
   // ── Router (path-based, with hash fallback) ──────────────────────
+
+  // FLOW 6 - PORTAL BRANDING EDITOR   /editor  (#<portal_token>&k=<jwt>)
+  // Staff-only. CRM mints editorUrl as origin + '/editor#' + portal_token and
+  // appends '&k=' + jwt into the SAME fragment so the write credential never
+  // hits a query string, access log, or Referer. The portal_token in the hash
+  // is what GET /public/:portalToken resolves; k is sent as X-Editor-Token on
+  // save. A missing or unknown token is NOT the empty landing page.
+  function parseEditorHash() {
+    var raw = (window.location.hash || '').replace(/^#/, '');
+    var token = '';
+    var key = '';
+    if (!raw) return { token: token, key: key };
+    var parts = raw.split('&');
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i];
+      if (!part) continue;
+      var eq = part.indexOf('=');
+      if (eq === -1) {
+        if (!token) {
+          try { token = decodeURIComponent(part); } catch (e) { token = part; }
+        }
+      } else {
+        var k = part.slice(0, eq);
+        var v = part.slice(eq + 1);
+        try { v = decodeURIComponent(v); } catch (e2) { /* keep raw */ }
+        if (k === 'k') key = v;
+        else if (!token) {
+          try { token = decodeURIComponent(part); } catch (e3) { token = part; }
+        }
+      }
+    }
+    return { token: token, key: key };
+  }
+
+  function goBackOrClose() {
+    if (window.history.length > 1) {
+      window.history.back();
+      return;
+    }
+    try { window.close(); } catch (e) { /* ignore */ }
+  }
+
+  function unknownPage(msg) {
+    return el('div', { class: 'cp-error' }, [
+      el('h1', { class: 'cp-h1', text: 'This link doesn\'t match a page' }),
+      el('p', { class: 'cp-sub', text: msg || 'Open the link you were sent from Agri360.' }),
+      el('button', {
+        class: 'cp-btn', type: 'button', text: 'Go back',
+        onclick: function () { goBackOrClose(); }
+      }),
+    ]);
+  }
+
+  function editorConfigured(b) {
+    if (!b || typeof b !== 'object') return false;
+    if (!(typeof b.displayName === 'string' && b.displayName.trim())) return false;
+    if (!(typeof b.primary === 'string' && /^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(b.primary.trim()))) return false;
+    var logo = typeof b.logoUrl === 'string' ? b.logoUrl.trim() : '';
+    var mark = typeof b.wordmark === 'string' ? b.wordmark.trim() : '';
+    return !!(logo || mark);
+  }
+
+  function loadEditor(portalToken, editorKey) {
+    if (!portalToken) {
+      return render(unknownPage('This editor link is missing a client token. Go back to Agri360 and click Set up portal again.'));
+    }
+    render(el('div', { class: 'cp-loading', text: 'Loading the portal editor.' }));
+    api('GET', '/api/portal-branding/public/' + encodeURIComponent(portalToken)).then(function (r) {
+      if (r.status === 404 || !r.ok || !r.data) {
+        return render(unknownPage('This link doesn\'t match a client portal. Go back to Agri360 and open Set up portal from that client.'));
+      }
+      renderEditor(portalToken, editorKey, r.data);
+    }).catch(function () {
+      render(unknownPage('Could not open the portal editor. Go back to Agri360 and try Set up portal again.'));
+    });
+  }
+
+  function renderEditor(portalToken, editorKey, payload) {
+    var branding = (payload && payload.branding && typeof payload.branding === 'object')
+      ? payload.branding
+      : {};
+    var state = {
+      displayName: branding.displayName || payload.name || '',
+      logoUrl: branding.logoUrl || '',
+      wordmark: branding.wordmark || '',
+      primary: branding.primary || '#2d7a3e',
+      primaryHover: branding.primaryHover || '#25652f',
+      primaryContrast: branding.primaryContrast || '#ffffff',
+      accent: branding.accent || '#f0a202',
+      radius: branding.radius == null ? 12 : branding.radius,
+      font: branding.font || "'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif",
+      welcomeTitle: branding.welcomeTitle || '',
+      welcomeNote: branding.welcomeNote || '',
+      supportName: branding.supportName || '',
+      supportEmail: branding.supportEmail || '',
+      poweredBy: branding.poweredBy !== false,
+    };
+
+    var previewCard = el('div', { class: 'cp-editor-preview' });
+    var statusEl = el('p', { class: 'cp-note' });
+    var saveBtn = el('button', {
+      class: 'cp-btn cp-btn-primary', type: 'button', text: editorKey ? 'Save branding' : 'Save branding'
+    });
+    if (!editorKey) saveBtn.disabled = true;
+
+    function field(label, key, kind) {
+      var input;
+      if (kind === 'textarea') {
+        input = el('textarea', { class: 'cp-textarea', rows: '3' });
+        input.value = state[key] == null ? '' : String(state[key]);
+      } else if (kind === 'color') {
+        var wrap = el('div', { class: 'cp-color-row' });
+        var picker = el('input', { type: 'color' });
+        var hex = /^#[0-9a-fA-F]{6}$/.test(String(state[key] || '')) ? state[key] : '#2d7a3e';
+        picker.value = hex;
+        input = el('input', { class: 'cp-input', type: 'text' });
+        input.value = state[key] == null ? '' : String(state[key]);
+        picker.addEventListener('input', function () {
+          input.value = picker.value;
+          state[key] = picker.value;
+          paintPreview();
+        });
+        input.addEventListener('input', function () {
+          state[key] = input.value;
+          if (/^#[0-9a-fA-F]{6}$/.test(input.value)) picker.value = input.value;
+          paintPreview();
+        });
+        wrap.appendChild(picker);
+        wrap.appendChild(input);
+        return el('div', { class: 'cp-field' }, [
+          el('label', { class: 'cp-field-label', text: label }),
+          wrap,
+        ]);
+      } else if (kind === 'number') {
+        input = el('input', { class: 'cp-input', type: 'number', min: '0', max: '28' });
+        input.value = state[key] == null ? '' : String(state[key]);
+      } else if (kind === 'checkbox') {
+        input = el('input', { type: 'checkbox' });
+        input.checked = !!state[key];
+        input.addEventListener('change', function () { state[key] = input.checked; paintPreview(); });
+        return el('div', { class: 'cp-field' }, [
+          el('label', { class: 'cp-field-label' }, [
+            input,
+            document.createTextNode(' ' + label),
+          ]),
+        ]);
+      } else {
+        input = el('input', { class: 'cp-input', type: kind || 'text' });
+        input.value = state[key] == null ? '' : String(state[key]);
+      }
+      if (kind !== 'checkbox' && kind !== 'color') {
+        input.addEventListener('input', function () {
+          if (kind === 'number') state[key] = Number(input.value);
+          else state[key] = input.value;
+          paintPreview();
+        });
+      }
+      return el('div', { class: 'cp-field' }, [
+        el('label', { class: 'cp-field-label', text: label }),
+        input,
+      ]);
+    }
+
+    var logoFile = el('input', { class: 'cp-input', type: 'file', accept: 'image/*' });
+    logoFile.addEventListener('change', function () {
+      var file = logoFile.files && logoFile.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function () {
+        state.logoUrl = String(reader.result || '');
+        logoUrlInput.value = state.logoUrl.indexOf('data:') === 0 ? '(image attached)' : state.logoUrl;
+        paintPreview();
+      };
+      reader.readAsDataURL(file);
+    });
+    var logoUrlInput = el('input', { class: 'cp-input', type: 'text', placeholder: 'https:// or paste a data URL' });
+    logoUrlInput.value = state.logoUrl && state.logoUrl.indexOf('data:') === 0 ? '(image attached)' : (state.logoUrl || '');
+    logoUrlInput.addEventListener('input', function () {
+      if (logoUrlInput.value !== '(image attached)') {
+        state.logoUrl = logoUrlInput.value;
+        paintPreview();
+      }
+    });
+
+    function paintPreview() {
+      clear(previewCard);
+      var mark = (state.wordmark || state.displayName || 'Preview').trim();
+      var swatch = el('div', { class: 'cp-editor-swatch', text: mark });
+      swatch.style.background = state.primary || '#2d7a3e';
+      swatch.style.color = state.primaryContrast || '#ffffff';
+      swatch.style.borderRadius = (Number(state.radius) || 0) + 'px';
+      swatch.style.fontFamily = state.font || 'inherit';
+      if (state.logoUrl && (state.logoUrl.indexOf('data:') === 0 || state.logoUrl.indexOf('http') === 0)) {
+        var img = el('img', { class: 'cp-editor-logo', alt: mark });
+        img.src = state.logoUrl;
+        swatch.textContent = '';
+        swatch.appendChild(img);
+      }
+      var ready = editorConfigured(state);
+      previewCard.appendChild(el('div', { class: 'cp-editor-preview-label', text: 'Client preview' }));
+      previewCard.appendChild(swatch);
+      previewCard.appendChild(el('p', {
+        class: 'cp-note',
+        text: ready
+          ? 'Ready. Focus points can go out once you save.'
+          : 'Needs a display name, a colour, and a logo or wordmark before this portal is set up.'
+      }));
+      if (state.welcomeTitle) previewCard.appendChild(el('p', { class: 'cp-editor-welcome', text: state.welcomeTitle }));
+    }
+
+    saveBtn.addEventListener('click', function () {
+      if (!editorKey) {
+        statusEl.textContent = 'This editor session has no save token. Go back to Agri360 and click Set up portal again.';
+        return;
+      }
+      saveBtn.disabled = true;
+      statusEl.textContent = 'Saving.';
+      var body = {
+        displayName: state.displayName,
+        logoUrl: state.logoUrl === '(image attached)' ? branding.logoUrl : state.logoUrl,
+        wordmark: state.wordmark,
+        primary: state.primary,
+        primaryHover: state.primaryHover,
+        primaryContrast: state.primaryContrast,
+        accent: state.accent,
+        radius: Number(state.radius) || 0,
+        font: state.font,
+        welcomeTitle: state.welcomeTitle,
+        welcomeNote: state.welcomeNote,
+        supportName: state.supportName,
+        supportEmail: state.supportEmail,
+        poweredBy: !!state.poweredBy,
+      };
+      api('PUT', '/api/portal-branding/public/' + encodeURIComponent(portalToken) + '/branding', body, {
+        'X-Editor-Token': editorKey,
+      }).then(function (r) {
+        saveBtn.disabled = false;
+        if (!r.ok) {
+          statusEl.textContent = (r.data && (r.data.error || r.data.userMessage))
+            || 'Could not save branding (' + r.status + ').';
+          return;
+        }
+        if (r.data && r.data.branding) {
+          Object.keys(r.data.branding).forEach(function (k) {
+            if (k !== 'configuredAt' && Object.prototype.hasOwnProperty.call(state, k)) {
+              state[k] = r.data.branding[k];
+            }
+          });
+        }
+        statusEl.textContent = editorConfigured(state)
+          ? 'Saved. This portal is set up. You can close this tab and go back to Agri360.'
+          : 'Saved. Add a logo or wordmark so the portal counts as set up.';
+        paintPreview();
+      }).catch(function () {
+        saveBtn.disabled = false;
+        statusEl.textContent = 'Could not save branding. Try again.';
+      });
+    });
+
+    var form = el('div', { class: 'cp-editor-form' }, [
+      el('h1', { class: 'cp-h1', text: 'Portal branding' }),
+      el('p', { class: 'cp-sub', text: 'This is what the client sees on their portal. Save before you close the tab.' }),
+      editorKey ? null : el('p', { class: 'cp-note', text: 'This editor session has no save token. Go back to Agri360 and click Set up portal again.' }),
+      field('Display name', 'displayName', 'text'),
+      el('div', { class: 'cp-field' }, [
+        el('label', { class: 'cp-field-label', text: 'Logo' }),
+        logoFile,
+        logoUrlInput,
+      ]),
+      field('Wordmark (shown when there is no logo)', 'wordmark', 'text'),
+      el('div', { class: 'cp-editor-row' }, [
+        field('Primary', 'primary', 'color'),
+        field('Primary hover', 'primaryHover', 'color'),
+      ]),
+      el('div', { class: 'cp-editor-row' }, [
+        field('Text on primary', 'primaryContrast', 'color'),
+        field('Accent', 'accent', 'color'),
+      ]),
+      field('Corner radius (0–28)', 'radius', 'number'),
+      field('Font', 'font', 'text'),
+      field('Welcome title', 'welcomeTitle', 'text'),
+      field('Welcome note', 'welcomeNote', 'textarea'),
+      field('Support name', 'supportName', 'text'),
+      field('Support email', 'supportEmail', 'email'),
+      field('Show ProAgri footer credit', 'poweredBy', 'checkbox'),
+      el('div', { class: 'cp-editor-actions' }, [
+        saveBtn,
+        el('button', {
+          class: 'cp-btn', type: 'button', text: 'Go back',
+          onclick: function () { goBackOrClose(); }
+        }),
+      ]),
+      statusEl,
+    ]);
+
+    paintPreview();
+    render(el('div', { class: 'cp-editor-layout' }, [form, previewCard]));
+  }
+
   function currentRoute() {
     var p = window.location.pathname;
     // /video-request is tokenless — the #prefill hash carries the routing. Match
@@ -3690,6 +3996,13 @@
     if (/^\/video-request\/?$/.test(p) ||
         (/^#?\/?video-request/.test(window.location.hash.replace(/^#/, '')) && p === '/')) {
       return { view: 'video-request', token: null };
+    }
+    // /editor — staff branding editor. Path is bare; the portal_token and the
+    // mint JWT both live in the fragment (#<portal_token>&k=<jwt>), never the
+    // query string. Match here so unknown-path landing cannot swallow it.
+    if (/^\/editor\/?$/.test(p)) {
+      var ed = parseEditorHash();
+      return { view: 'editor', token: ed.token, editorKey: ed.key };
     }
     // /preview/:portalToken/:itemId — read-only collateral preview (CRM "Preview"
     // button). Portal-scoped: the CRM now passes the client's portal_token as the
@@ -3742,14 +4055,12 @@
     if (r.view === 'approvals' && r.token) return loadApprovals(r.token);
     if (r.view === 'dashboard' && r.token) return loadDashboard(r.token);
     if (r.view === 'video-forms' && r.token) return loadVideoForms(r.token);
+    if (r.view === 'editor') return loadEditor(r.token, r.editorKey);
     return render(landing());
   }
 
   function landing() {
-    return el('div', { class: 'cp-empty' }, [
-      el('h1', { class: 'cp-h1', text: 'ProAgri Client Portal' }),
-      el('p', { class: 'cp-sub', text: 'Please open the link you were sent to view your form or content approvals.' }),
-    ]);
+    return unknownPage('This address is not a form, dashboard, or portal editor. Open the link you were sent from Agri360.');
   }
 
   window.addEventListener('hashchange', route);

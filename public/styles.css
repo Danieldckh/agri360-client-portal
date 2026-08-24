@@ -1227,3 +1227,56 @@ body {
   .cp-ccs-navbtn { flex: 1 1 0; padding: 10px 12px; }
   .cp-ccs-markbtn { font-size: 11px; padding: 5px 10px; }
 }
+
+/* Portal branding editor (/editor) */
+.cp-editor-layout {
+  display: grid;
+  gap: 24px;
+}
+@media (min-width: 800px) {
+  .cp-editor-layout { grid-template-columns: 1fr 280px; align-items: start; }
+}
+.cp-editor-preview {
+  border: 1px solid var(--cp-border);
+  border-radius: var(--cp-radius);
+  padding: 20px;
+  background: var(--cp-surface);
+  box-shadow: var(--cp-shadow);
+}
+@media (min-width: 800px) {
+  .cp-editor-preview { position: sticky; top: 80px; }
+}
+.cp-editor-preview-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--cp-text-muted);
+  margin: 0 0 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.cp-editor-swatch {
+  min-height: 72px;
+  padding: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  overflow: hidden;
+}
+.cp-editor-logo {
+  max-height: 56px;
+  max-width: 100%;
+  object-fit: contain;
+}
+.cp-editor-welcome { font-weight: 600; margin: 12px 0 0; }
+.cp-editor-row { display: flex; gap: 12px; flex-wrap: wrap; }
+.cp-editor-row .cp-field { flex: 1; min-width: 140px; }
+.cp-color-row { display: flex; gap: 8px; align-items: center; }
+.cp-color-row input[type=color] {
+  width: 40px; height: 36px; padding: 0;
+  border: 1px solid var(--cp-border); border-radius: 8px;
+  background: transparent; cursor: pointer;
+}
+.cp-editor-actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 8px 0 12px; }
+
